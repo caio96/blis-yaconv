@@ -1,26 +1,3 @@
-<style>
-/* Floating button linking to top, from https://www.fabriziomusacchio.com/blog/2022-06-30-Markdown_back_to_top_button/ */
-.top-link {
-  position:         fixed;
-  bottom:           0;
-  right:            0;
-  display:          inline-flex;
-  color:            #000000;
-
-  cursor:           pointer;
-  align-items:      center;
-  justify-content:  center;
-  margin:           0 2em 2em 0;
-  border-radius:    50%;
-  padding:          .25em;
-  width:            1em;
-  height:           1em;
-  background-color: #F8F8F8;
-}
-</style>
-<a class="top-link hide" href="#top">↑</a>
-<a name="top"></a>
-
 # Contents
 
 * **[Introduction](PluginHowTo.md#introduction)**
@@ -36,6 +13,10 @@
   * **[Example: `bli_gemmt_ex`](PluginHowTo.md#example-bli_gemmt_ex)**
   * **[The Control Tree](PluginHowTo.md#the-control-tree)**
   * **[Modifying the Control Tree](PluginHowTo.md#modifying-the-control-tree)**
+  * **[Modifications to Blocking](PluginHowTo.md#modifications-to-blocking)**
+  * **[Modifications to Packing](PluginHowTo.md#modifications-to-packing)**
+  * **[Modifications to Computation](PluginHowTo.md#modifications-to-computation)**
+  * **[SYRKD](PluginHowTo.md#syrkd)**
 * **[API Reference](PluginHowTo.md#api-reference)**
   * **[Registration](PluginHowTo.md#registration)**
   * **[Helper Functions](PluginHowTo.md#helper-functions)**
@@ -252,21 +233,486 @@ By default, this file contains the mapping known by BLIS at the time of plugin c
 
 # Custom Operations
 
-BLIS is written as a framework, meaning that user-written code can be inserted in order to achieve new functionality. For example, consider the mathematical operation $C := \alpha A D A^T + \beta C$ where $D$ is a diagonal matrix. If $D$ were the identity matrix, then this would be a standard level-3 BLAS operation, `SYRK`, so we call this BLAS-like operation `SYRKD`. While it is technically not necessary to use the plugin infrastructure to implement `SYRKD` using BLIS, extending BLAS operations typically requires new kernels which are conveniently managed as a plugin. However, the code discussed in this section does not need to exist in the plugin directory (although it can be placed in the top-level plugin directory) but should have access to the kernel, blocksize, and kernel preference IDs registered by the plugin.
+BLIS is written as a framework, meaning that user-written code can be inserted in order to achieve new functionality. For example, consider the mathematical operation $\mathop{\text{tri}}(C) := \mathop{\text{tri}}(\alpha A D A^T + \beta C)$ where $D$ is a diagonal matrix and the function `tri` operates only on the upper or lower part of a matrix. If $D$ were the identity matrix, then this would be a standard level-3 BLAS operation, `SYRK`, so we call this BLAS-like operation `SYRKD`. While it is technically not necessary to use the plugin infrastructure to implement `SYRKD` using BLIS, extending BLAS operations typically requires new kernels which are conveniently managed as a plugin. However, the code discussed in this section does not need to exist in the plugin directory (although it can be placed in the top-level plugin directory) but should have access to the kernel, blocksize, and kernel preference IDs registered by the plugin.
 
-Because $A D A^T = A (A D)^T = A B = (A D) A^T = B^T A^T$ where $B = (A D)^T$, it is actually even more closely related to the operation `GEMMT`, which implements $\operatorname{tri}(C) := \operatorname{tri}(\alpha A B + \beta C)$ where the function `tri` operates only on the upper or lower part of a matrix. Essentially, this is just `GEMM` where we know the result will in fact be symmetric even though $A \ne B^T$.
+Because $A D A^T = A (A D)^T = (A D) A^T$, it is actually even more closely related to the operation `GEMMT`, which implements $\mathop{\text{tri}}(C) := \mathop{\text{tri}}(\alpha \mathop{\text{trana}}(A) \mathop{\text{tranb}}(B) + \beta C)$ where the functions `trana` and `tranb` optionally transpose the operand. Essentially, this is just `GEMM` where we know the result will in fact be symmetric even though $A \ne B^T$. Then we can see that `SYRKD` is the same thing as `GEMMT` with $B = AD$, $\mathop{\text{trana}}(A)=A$ and $\mathop{\text{tranb}}(B)=B^T$. So, let's implement `SYRKD` by:
+
+1. Starting with the high-level code which defines `GEMMT`.
+
+2. Writing a kernel to handle the multiplication $A D$ when packing the "virtual" matrix $B$.
+
+3. Modifying the `GEMMT` operation to use our custom packing kernel.
+
+4. Supplying additional data so that the packing kernel can address $D$ (in addition to $A$ which is passed as a normal parameter of `GEMMT`).
 
 ## Example: `bli_gemmt_ex`
 
-TODO
+Consider the following code which implements `GEMMT`:
+
+```C
+/*
+ * Step 0:
+ */
+void bli_gemmt_ex
+     (
+       const obj_t*  alpha,
+       const obj_t*  a,
+       const obj_t*  b,
+       const obj_t*  beta,
+       const obj_t*  c,
+       const cntx_t* cntx,
+       const rntm_t* rntm
+     )
+{
+    /*
+     * Step 1: Make sure BLIS is initialized.
+     */
+    bli_init_once();
+
+    /*
+     * Step 2: Check the operands for consistency and check for cases where
+     *         we can exit early (alpha = 0, m = 0, etc.).
+     */
+    if ( bli_error_checking_is_enabled() )
+        bli_gemmt_check( alpha, a, b, beta, c, cntx );
+
+    if ( bli_l3_return_early_if_trivial( alpha, a, b, beta, c ) == BLIS_SUCCESS )
+        return;
+
+    /*
+     * Step 3: Determine if we can and should use the 1m method for
+     *         cases with all complex operands.
+     */
+    num_t dt = bli_obj_dt( c );
+    ind_t im = BLIS_NAT;
+
+    if ( bli_obj_dt( a ) == bli_obj_dt( c ) &&
+         bli_obj_dt( b ) == bli_obj_dt( c ) &&
+         bli_obj_is_complex( c ) )
+        // Usually BLIS_NAT if a complex microkernel is available,
+        // otherwise BLIS_1M.
+        im = bli_gemmtind_find_avail( dt );
+
+    /*
+     * Step 4: Alias A, B, and C so that we have local mutable copies and
+     *         to take care of implicit transpose, sub-matrix references,
+     *         etc.
+     */
+    obj_t a_local;
+    obj_t b_local;
+    obj_t c_local;
+    bli_obj_alias_submatrix( a, &a_local );
+    bli_obj_alias_submatrix( b, &b_local );
+    bli_obj_alias_submatrix( c, &c_local );
+
+    /*
+     * Step 5: Create a "default" control tree.
+     */
+    if ( cntx == NULL ) cntx = bli_gks_query_cntx();
+    gemm_cntl_t cntl;
+    bli_gemm_cntl_init
+    (
+      im,
+      BLIS_GEMMT,
+      alpha,
+      &a_local,
+      &b_local,
+      beta,
+      &c_local,
+      cntx,
+      &cntl
+    );
+
+    /*
+     * Step 6: Execute the control tree in parallel.
+     */
+    bli_l3_thread_decorator
+    (
+      &a_local,
+      &b_local,
+      &c_local,
+      cntx,
+      ( cntl_t* )&cntl,
+      rntm
+    );
+}
+```
+
+### Step 0: Function signature
+
+The function name and signature is entirely up to you. Your function can take `obj_t`s as parameters, but you can also contruct `obj_t`s internally based on whatever function parameters you define (see Step 4 for more on this).
+
+For `SYRKD`, we would need to add a `const obj_t* D` parameter, and the `const obj_t* B` parameter can be removed since we know that $B = A^T$.
+
+### Step 1: Intialize BLIS
+
+This step is mandatory and must be done before calling any other BLIS APIs used here. Most BLIS API calls (like `bli_gemm`) check for initialization themselves, but the control tree and thread decorator APIs do not.
+
+### Step 2: Error and early exit checks
+
+BLIS has some standard checks for typical level-3 BLAS operations, as well as checks for conditions which enable an early exit. You may use these functions, but for new operations you may need to include additional checks. Also note that `bli_l3_return_early_if_trivial` assumes that `C` is a dense matrix and will attempt to scale by `beta` if exiting early. If `C` refers to a matrix-like object with alternative layout then you will need to check for early exit conditions manually.
+
+For example, when implementing `SYRKD`, all of the checks done by `bli_gemmt_check` are still relevant (relatize size/shape of `A`, `B`, `C`, triangular `C`, etc.). We would also want to check that `C` is symmetric, and that `D` is a vector and has the correct length. In a complex Hermitian version (e.g. `HERKD`) we might also want to enforce that `D` is real. Because `C` is a normal, dense matrix, we can also call `bli_l3_return_early_if_trivial` safely.
+
+### Step 3: Check for 1m or "natural" complex execution
+
+This step is optional. If your operation doesn't support complex operands, or if you don't want to support the 1m method (which requires additional kernels, see below), then you can always default to `BLIS_NAT` as the execution method.
+
+The functions `bli_XXXind_find_avail` are likely not useful for custom code, but you can check if an optimized complex-domain `GEMM` microkernel is available by using:
+
+```C
+bool c_optimized = ! bli_gks_cntx_ukr_is_ref( BLIS_SCOMPLEX, BLIS_GEMM_UKR, cntx );
+```
+
+Note that if the complex-domain `GEMM` microkernel is not optimized then using `BLIS_NAT` may decrease performance.
+
+### Step 4: Alias local matrices
+
+Your function may or may not operate on normal, dense matrices represented as BLIS `obj_t`s. If so, then code similar to that used for `GEMMT` is recommended, since it handles implicit transposition of the operants, cases where a sub-matrix of a larger matrix is indicated, etc.
+
+**If instead you are using "matrix-like" operands, then you will still need to construct an `obj_t`** In this case, the `obj_t` simply indicates the size and shape of the object when logically viewed as a matrix. For example, a dense tensor can be mapped onto a matrix by collecting some tensor dimensions as the "rows" and the remaining dimensions as the "columns". The locations of elements are determined by the tensor strides, ordering of dimensions within rows and columns, etc. and does not translate directly to a matrix row-major or column-major layout. This is OK! BLIS will simply keep track of the matrix partitioning, and as long as you provide a custom packing kernel which knows *how* to access the data, BLIS will tell your kernel *what* data (logical sub-matrix) to pack. The same concept applies to the computational (`GEMM`) kernel.
+
+BLIS only needs `obj_t`s for the `A`, `B`, and `C` matrices (as they are defined in `GEMM` and related operations). Note that the `obj_t` representing the output matrix (`C`) should have row stride (`rs`) and column (`cs`) stride values set to indicate a "row-preference" (`rs < cs`) or "column-preference" (`cs < rs`). All other `obj_t`s only need to have the matrix length and width set, unless you are using default kernels which then need a full matrix specification. If your operation references other data or objects (like the `D` operand in `SYRKD`) or your matrix-like objects need data which doesn't fit in an `obj_t`, then this information will be provided separately (see below).
+
+For `SYRKD`, the `A` and `C` matrices are already `obj_t`s and we should just alias the sub-matrices. The `obj_t` for `B` can be constructed from `A` with a transpose. For `D`, we have also chosen to pass in an `obj_t` representing a vector (mathematically, the diagonal of a matrix), and so we can just alias a sub-matrix to clean it up.
+
+### Step 5: Create the control tree
+
+The control tree determines exactly what operations are done during execution and their parameters (see more below). Custom operations will typically begin with a "default" control tree which corresponds to the most similar level-3 BLAS operation. The particular level-3 operation used does matter: for example `TRMM` will only operate on the upper or lower part of a matrix, and other factors such as threading can be affected as well. In order to accomodate custom operations, the control tree will then need to be modified. This is discussed in the following sections.
+
+For `SYRKD`, since the output matrix is symmetric (stored as triangular), we should use `GEMMT` as the template for the control tree. Note that `SYRK`, `SYR2K`, `HERK`, and `HER2K` all use the `GEMMT` control tree.
+
+### Step 6: Execute the control tree
+
+This step should be essentially the same for all operations. The `A`, `B`, and `C` objects are those `obj_t`s created earlier (and which may only be logical matrices with a length and width only if you provide custom kernels). The control tree and context are passed in, as well as a "runtime" (`rntm_t`) object. Typically, the pointer to the runtime is `NULL`, which uses default settings for threading. If you want to customize threading then you can also pass in a custom `rntm_t` object.
 
 ## The Control Tree
 
-TODO
+![BLIS GEMM algorithm](diagrams/mmbp_algorithm_color.png)
+
+*Figure 1: The GEMM algorithm in BLIS*
+
+A typical `GEMM` operation in BLIS is depicted visually in Fig. 1. The matrix objects `A`, `B`, and `C` (represented as `obj_t`s) only provide limited information about size/shape and, for normal dense matrices, data location and layout. The rest of the information about how to execute the operation, including what order to partition the matrix dimensions, what blocksizes to use, what kernels to use for packing and computation, what parts of the matrices to operate on (for triangular/symmetric matrices), how to apply threading, etc. is all stored in the "control tree". This is a tree-based data structure, where each node indicates a primitive operation to be performed, which is executed by a specific kernel. The built-in control tree nodes are:
+
+- Partitioning along the "m", "n", or "k" dimensions (as defined in `GEMM`).
+
+- Packing of the `A` or `B` matrix. Packing moves data into a specialized layout which provides better data locality. While packing kernels should typically place some sort of data into a packed buffer (in a format which the computational kernel can understand), it could also perform any operation on the input matrix while doing so. In general, we could denote this as $A_{packed} = pack(op(A,...))$, where the ellipsis indicates additional information that can be stored in the control tree.
+
+- Computation (`GEMM` and `GEMMTRSM`). Only `GEMM`-like computation can be customized currently. This operation doesn't have to actually perform a `GEMM` computation ($C = \alpha A B + \beta C$). Rather, it can perform any operation $C = op(A,B,C,...)$ where the ellipsis indicates additional information that can be stored in the control tree.
+
+The control tree manages the flow of data through the processor caches by partitioning the matrices, using the estimated number and timing of memory accesses performed by the kernels. Thus, for operations which are truly `GEMM`-like, most of the control tree would not need to be modified. Operations which deal with less, more, or simply different data may need adjustments to blocksizes, or in extreme cases, the structure of the control tree. Altering the control tree structure and adding new custom control tree nodes are beyond the scope of this tutorial.
 
 ## Modifying the Control Tree
 
-TODO
+In order to get BLIS to do anything other than `GEMM` (or the related level-3 BLAS operation used as a template for the control tree), the control tree must be modified. Currently, the following aspects of the control tree can be modified:
+
+- The blocksizes used when partitioning. The 5 "standard" blocksizes `MC`, `NC`, `KC`, `MR`, and `NR` can be modified for `GEMM`-like operations. Note that modifying `MR` and `NR` in particular may require changes to your packing and/or computational kernels, since this affects the layout of packed data.
+
+- The packing "microkernel", which is used to pack a small portion of a matrix (at most `MR x KC` or `NR x KC`). If data is to be packed in the same format as for a normal dense matrix, but read from a different layout and/or with operations applied during packing, then changing only the packing microkernel is likely sufficient.
+
+- The packing "variant", which is responsible for a) obtaining a memory buffer of the appropriate size for the packed data, b) setting up the packed matrix object, and c) actually performing the packing (typically by calling a packing microkernel, however packing variants can be implemented many different ways). Modifying the packing variant may be necessary if data is to be packed in a substantially different format or other situations beyond the scope of a simple microkernel.
+
+- The computational microkernel (which is the `GEMM` microkernel by default). The computational microkernel reads data from the packed buffers and then does "something" with it, typically in combination with data from the matrix `C`. Usually, the `C` matrix also represents an output which is written by the microkernel. Note that when replacing only the microkernel, both packed data and the representation of output data in `C` must be similar to the standard `GEMM` case. So, this modification is most effective for relatively `GEMM`-like operations.
+
+- The computational variant, which is responsible for performing some operation on the entirety of the packed data as well as the matrix `C`. By modifying the entire computational variant, the user has complete freedom in the amount and format of data which is packed and in the data represented by `C`.
+
+Between modifying the control tree and execution, users should always call `bli_gemm_cntl_finalize` in order to maintain consistency between various parameters (see below).
+
+Note that when modifying one component it may also be necessary to modify other components in order to maintain consistency. For example, changing the pack format used by the packing microkernel would require a computational microkernel which can read the new format. Likewise, changing the register blocksizes (`MR` and/or `NR`) might require writing new packing or computational microkernels to take advantage of the new blocksize. The default microkernels are written to accept any register blocksize, although they are most efficient with the default `MR` and `NR`.
+
+In the case of `SYRKD`, the only changes necessary are applying multiplication of either `A` or `B` by the diagonal matrix `D` (represented as a vector) during packing. So, it is only necessary to write a new packing microkernel and insert it into the control tree.
+
+## Modifications to Blocking
+
+The BLIS framework applies blocking (partitioning) to the matrices during the computation, resulting in smaller and smaller submatrices which ideally fit into successive levels of the cache hierarchy. The control tree nodes control which dimension is blocked at which level. Modifying the actual control tree structure is beyond the scope of this tutotial. However, it may often be necessary to control the blocksize used at each level. For example, the blocksize used in the top-level partitioning, `NC`, can be modified using:
+
+```C
+blksz_t nc;
+//                        S     D     C     Z
+bli_blksz_init_easy( &nc, 8092, 5150, 2244, 2244 );
+bli_gemm_cntl_set_nc( &nc, &cntl );
+```
+
+where `cntl` is a `gemm_cntl_t` object which has been initialized with `bli_gemm_cntl_init`. Note that the `blksz_t` object used to set `NC` contains values for each datatype. Supplying values for all datatypes (even though the operation being performed uses a specific and known set of datatypes) is recommended because the control tree is sometimes constructed to use blocksizes and even microkernels from related datatypes, such as in mixed-domain computations.
+
+The function `bli_blksz_init` also lets users specify extended blocksizes. For cache blocking (`MC`, `NC`, `KC`), the extended blocksizes is the maximum partition size and the normal blocksize is the default partition size. If the remainder block after partitioning by the default size is less than max minus default, then it is merged with another block. This can be useful for smoothing out performance drops for matrices just larger than the blocksize. For register blocksizes (`MR` and `NR`), the extended blocksize is the size used for computing the size of the packed buffer and the leading dimension of the indiviual sub-matrices packed by the microkernel. If it is larger than the default blocksize then there will be unused elements in the pack buffer. This can be useful for e.g. aligning packed sub-matrices on cache line boundaries.
+
+BLIS requires the `MC`(default and extension) be a multiple of `MR` (default only), and likewise of `NC` and `NR`. Also, in operations with triangular/symmetric/hermitian matrices, BLIS may also require `KC` to be a multiple of either `MR` or `NR`. The function `bli_gemm_cntl_finalize` tweaks the cache blocksizes, if necessary, to maintain these relationships.
+
+Finally, note that changing, in particular, the register blocksizes may require changes in user-defined microkernels if any assumptions about register blocking are hard-coded.
+
+## Modifications to Packing
+
+Packing the `A` and `B` matrices is represented as nodes in the control tree. These control tree nodes contain a pointer to the packing variant, as well as to a "params" structure containing any additional data needed. Packing variants have the following signature:
+
+```C
+void pack_variant(  const obj_t*     a,
+                          obj_t*     p,
+                    const cntx_t*    cntx,
+                    const cntl_t*    cntl,
+                          thrinfo_t* thread );
+```
+
+where `a` is the matrix to pack and `p` is an uninitialized matrix object which should represent the packed matrix on return. You can set a custom packing variant with:
+
+```C
+bli_gemm_cntl_set_pack[ab]_var( &pack_variant, &cntl );
+```
+
+If the default parameter structure which is included in the `gemm_cntl_t` object (and which is pointed to by the default value of the params pointer) can be used by your custom packing variant, then the [packing parameters API](????) can be used. However, if different information is required then you can create your own structure (which must be treated as read-only during the operation) and insert it into the control tree with:
+
+```C
+my_params_t params;
+// intialize params...
+bli_gemm_cntl_set_pack[ab]_params( &params, &cntl );
+```
+
+and obtained within the packing variant using:
+
+```C
+my_params_t* params = ( my_params_t* )bli_packm_cntl_variant_params( cntl );
+```
+
+If instead only the packing microkernel needs to be modified, you can set a new packing microkernel with:
+
+```C
+func_t pack_ukr;
+bli_func_init( &pack_ukr, &spack_ukr, &dpack_ukr, &cpack_ukr, &zpack_ukr );
+bli_gemm_cntl_set_pack[ab]_ukr_simple( &pack_ukr, &cntl );
+```
+
+for packing without datatype conversion (mixed-precision/mixed-domain), or in the most general case:
+
+```C
+func2_t pack_ukr;
+bli_func2_init( &pack_ukr, ... );
+bli_gemm_cntl_set_pack[ab]_ukr( &pack_ukr, &cntl );
+```
+
+Packing microkernels must have a signature compatible with:
+
+```C
+xpack_ukr(       struc_t strucc,
+                 diag_t  diagc,
+                 uplo_t  uploc,
+                 conj_t  conjc,
+                 pack_t  schema,
+                 bool    invdiag,
+                 dim_t   panel_dim,
+                 dim_t   panel_len,
+                 dim_t   panel_dim_max,
+                 dim_t   panel_len_max,
+                 dim_t   panel_dim_off,
+                 dim_t   panel_len_off,
+                 dim_t   panel_bcast,
+           const void*   kappa,
+           const void*   c, inc_t incc, inc_t ldc,
+                 void*   p,             inc_t ldp,
+           const void*   params,
+           const cntx_t* cntx );
+```
+
+Note that the packing microkernel also receives a params pointer. This pointer is `NULL` by default but can be set using `bli_gemm_cntl_set_pack[ab]_params` just as for the packing variant params.
+
+## Modifications to Computation
+
+Similar to packing, the computation phase of the operation is represented as a control tree node. The computational variant must have the following signature:
+
+```C
+void comp_variant( const obj_t*     a,
+                   const obj_t*     b,
+                   const obj_t*     c,
+                   const cntx_t*    cntx,
+                   const cntl_t*    cntl,
+                         thrinfo_t* thread );
+```
+
+You can set a custom computational variant with:
+
+```C
+bli_gemm_cntl_set_var( &comp_variant, &cntl );
+```
+
+If the default parameter structure which is included in the `gemm_cntl_t` object can be used by your custom computational variant, then the [computational parameters API](????) can be used. However, if different information is required then you can create your own structure (which must be treated as read-only during the operation) and insert it into the control tree with:
+
+```C
+my_params_t params;
+// intialize params...
+bli_gemm_cntl_set_params( &params, &cntl );
+```
+
+and obtained within the packing variant using:
+
+```C
+my_params_t* params = ( my_params_t* )bli_gemm_var_cntl_params( cntl );
+```
+
+If instead only the computational microkernel needs to be modified, you can set a new microkernel with:
+
+```C
+func_t comp_ukr;
+bli_func_init( &comp_ukr, &scomp_ukr, &dcomp_ukr, &ccomp_ukr, &zcomp_ukr );
+bli_gemm_cntl_set_ukr_simple( &comp_ukr, &cntl );
+```
+
+for computation without datatype conversion for output to `C` (mixed-precision/mixed-domain), or in the most general case:
+
+```C
+func2_t comp_ukr;
+bli_func2_init( &comp_ukr, ... );
+bli_gemm_cntl_set_ukr( &comp_ukr, &cntl );
+```
+
+Computational microkernels must have a signature compatible with:
+
+```C
+xcomp_ukr(       dim_t      m,
+                 dim_t      n,
+                 dim_t      k,
+           const void*      alpha,
+           const void*      a,
+           const void*      b,
+           const void*      beta,
+                 void*      c, inc_t rs_c, inc_t cs_c,
+           const auxinfo_t* auxinfo,
+           const cntx_t*    cntx );
+```
+
+As with packing microkernels, a params pointer is also available to computational microkernels and can be set using `bli_gemm_cntl_set_params`. The params pointer is stored in the `auxinfo_t` struct, and can be obtained with `bli_auxinfo_params( &auxinfo )` (see also the [auxinfo API](???)).
+
+## SYRKD
+
+Taking all of the above considerations in to account, we can finally implement `SYRKD` (for double-precision operands only, some error checking omitted):
+
+```C
+typedef struct
+{
+    const double* d;
+    inc_t incd;
+} syrkd_params;
+
+/*
+ * This function should ideally be defined in a plugin and registered with the context.
+ * Then, it could be obtained using `bli_cntx_get_ukr_dt` below for the appropriate
+ * hardware detected at runtime.
+ */
+void dsyrkd_pack(       struc_t       strucc,
+                        diag_t        diagc,
+                        uplo_t        uploc,
+                        conj_t        conjc,
+                        pack_t        schema,
+                        bool          invdiag,
+                        dim_t         panel_dim,
+                        dim_t         panel_len,
+                        dim_t         panel_dim_max,
+                        dim_t         panel_len_max,
+                        dim_t         panel_dim_off,
+                        dim_t         panel_len_off,
+                        dim_t         panel_bcast,
+                  const double*       kappa_ptr,
+                  const double*       c, inc_t incc, inc_t ldc,
+                        double*       p,             inc_t ldp,
+                  const syrkd_params* params,
+                  const cntx_t*       cntx )
+{
+    inc_t incd = params->incd;
+    const double* d = params->d + panel_dim_off*incd;
+    double kappa = *kappa_ptr;
+
+    for (dim_t p = 0;p < panel_len;p++)
+    for (dim_t i = 0;i < panel_dim;i++)
+    for (dim_t r = 0;r < panel_bcast;r++)
+        p[i*panel_bcast + r + p*ldp] = kappa * d[i*incd] * c[i*incc + p*ldc];
+
+    bli_dset0s_edge
+    (
+      panel_dim*panel_bcast, panel_dim_max*panel_bcast,
+      panel_len, panel_len_max,
+      p, ldp
+    );
+}
+
+void dsyrkd
+     (
+       const obj_t*  alpha,
+       const obj_t*  a,
+       const obj_t*  d,
+       const obj_t*  beta,
+       const obj_t*  c,
+       const cntx_t* cntx,
+       const rntm_t* rntm
+     )
+{
+    bli_init_once();
+
+    if ( bli_error_checking_is_enabled() )
+        bli_syrk_check( alpha, a, beta, c, cntx );
+
+    // Additional checks for D...
+
+    obj_t b;
+    bli_obj_alias_with_trans( BLIS_TRANSPOSE, a, &b );
+
+    if ( bli_l3_return_early_if_trivial( alpha, a, &b, beta, c ) == BLIS_SUCCESS )
+        return;
+
+    num_t dt = bli_obj_dt( c );
+    ind_t im = BLIS_NAT;
+
+    obj_t a_local;
+    obj_t b_local;
+    obj_t c_local;
+    obj_t d_local;
+    bli_obj_alias_submatrix(  a, &a_local );
+    bli_obj_alias_submatrix( &b, &b_local );
+    bli_obj_alias_submatrix(  c, &c_local );
+    bli_obj_alias_submatrix(  d, &d_local );
+
+    if ( cntx == NULL ) cntx = bli_gks_query_cntx();
+    gemm_cntl_t cntl;
+    bli_gemm_cntl_init
+    (
+      im,
+      BLIS_GEMMT,
+      alpha,
+      &a_local,
+      &b_local,
+      beta,
+      &c_local,
+      cntx,
+      &cntl
+    );
+
+    func_t pack_ukr;
+    bli_func_set_dt( &dsyrkd_pack, BLIS_DOUBLE, &pack_ukr );
+
+    syrkd_params params;
+    params.d = ( const double* )bli_obj_buffer( &d_local );
+    params.incd = bli_obj_vector_inc( &d_local );
+
+    bli_gemm_cntl_set_packb_ukr_simple( &pack_ukr, &cntl );
+    bli_gemm_cntl_set_packb_params( &params, &cntl );
+
+    bli_gemm_cntl_finalize
+    (
+      BLIS_GEMMT
+      &a_local,
+      &b_local,
+      &c_local,
+      &cntl
+    );
+
+    bli_l3_thread_decorator
+    (
+      &a_local,
+      &b_local,
+      &c_local,
+      cntx,
+      ( cntl_t* )&cntl,
+      rntm
+    );
+}
+```
 
 # API Reference
 
@@ -658,4 +1104,192 @@ bool bli_cntx_get_ukr_prefs_dt( num_t dt, siz_t ukr_pref_id, const cntx_t* cntx 
 
 ## Control tree modification
 
-TODO
+BLIS_EXPORT_BLIS void bli_gemm_cntl_init
+     (
+             ind_t        im,
+             opid_t       family,
+       const obj_t*       alpha,
+             obj_t*       a,
+             obj_t*       b,
+       const obj_t*       beta,
+             obj_t*       c,
+       const cntx_t*      cntx,
+             gemm_cntl_t* cntl
+     );
+
+BLIS_EXPORT_BLIS void bli_gemm_cntl_finalize
+     (
+             opid_t       family,
+       const obj_t*       a,
+       const obj_t*       b,
+       const obj_t*       c,
+             gemm_cntl_t* cntl
+     );
+
+```C++
+gemm_ukr_ft bli_gemm_cntl_ukr( gemm_cntl_t* cntl );
+```
+
+```C++
+bool bli_gemm_cntl_row_pref( gemm_cntl_t* cntl );
+```
+
+```C++
+const void* bli_gemm_cntl_params( gemm_cntl_t* cntl );
+```
+
+```C++
+l3_var_oft bli_gemm_cntl_var( gemm_cntl_t* cntl );
+```
+
+```C++
+packm_ker_ft bli_gemm_cntl_packa_ukr( gemm_cntl_t* cntl );
+```
+
+```C++
+pack_t bli_gemm_cntl_packa_schema( gemm_cntl_t* cntl );
+```
+
+```C++
+const void* bli_gemm_cntl_packa_params( gemm_cntl_t* cntl );
+```
+
+```C++
+packm_var_oft bli_gemm_cntl_packa_var( gemm_cntl_t* cntl );
+```
+
+```C++
+packm_ker_ft bli_gemm_cntl_packb_ukr( gemm_cntl_t* cntl );
+```
+
+```C++
+pack_t bli_gemm_cntl_packb_schema( gemm_cntl_t* cntl );
+```
+
+```C++
+const void* bli_gemm_cntl_packb_params( gemm_cntl_t* cntl );
+```
+
+```C++
+packm_var_oft bli_gemm_cntl_packb_var( gemm_cntl_t* cntl );
+```
+
+```C++
+dim_t bli_gemm_cntl_mr_def( gemm_cntl_t* cntl );
+```
+
+```C++
+dim_t bli_gemm_cntl_mr_pack( gemm_cntl_t* cntl );
+```
+
+```C++
+dim_t bli_gemm_cntl_nr_def( gemm_cntl_t* cntl );
+```
+
+```C++
+dim_t bli_gemm_cntl_nr_pack( gemm_cntl_t* cntl );
+```
+
+```C++
+dim_t bli_gemm_cntl_mc_def( gemm_cntl_t* cntl );
+```
+
+```C++
+dim_t bli_gemm_cntl_mc_max( gemm_cntl_t* cntl );
+```
+
+```C++
+dim_t bli_gemm_cntl_nc_def( gemm_cntl_t* cntl );
+```
+
+```C++
+dim_t bli_gemm_cntl_nc_max( gemm_cntl_t* cntl );
+```
+
+```C++
+dim_t bli_gemm_cntl_kc_def( gemm_cntl_t* cntl );
+```
+
+```C++
+dim_t bli_gemm_cntl_kc_max( gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_ukr( const func2_t* ukr, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_ukr_simple( const func_t* ukr, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_row_pref( const mbool_t* row_pref, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_params( const void* params, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_var( l3_var_oft var, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_packa_ukr( const func2_t* ukr, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_packa_ukr_simple( const func_t* ukr, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_packa_schema( pack_t schema, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_packa_params( const void* params, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_packa_var( packm_var_oft var, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_packb_ukr( const func2_t* ukr, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_packb_ukr_simple( const func_t* ukr, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_packb_schema( pack_t schema, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_packb_params( const void* params, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_packb_var( packm_var_oft var, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_mr( const blksz_t* mr, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_nr( const blksz_t* nr, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_mc( const blksz_t* mc, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_nc( const blksz_t* nc, gemm_cntl_t* cntl );
+```
+
+```C++
+void bli_gemm_cntl_set_kc( const blksz_t* kc, gemm_cntl_t* cntl );
+```
