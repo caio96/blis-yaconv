@@ -43,58 +43,55 @@ static int MR, NR, MC, KC, NC;
 static float *filter_buf = NULL, *image_buf = NULL, *output_buf = NULL;
 
 // GEMM microkernel
-static void sgemm_ukr(int mr, int nr, int k,
-                      float *alpha, float *a, float *b,
+static void sgemm_ukr(int mr, int nr, int k, float *alpha, float *a, float *b,
                       float *beta, float *c, int rsc, int csc) {
   bli_sgemm_ukernel(mr, nr, k, alpha, a, b, beta, c, rsc, csc, auxinfo, cntx);
 }
 
 // Convenience page-aligned alloc with return check
 static float *aligned_alloc(int size) {
-    float *data = NULL;
-    int ret = posix_memalign((void**)&data, BLIS_PAGE_SIZE,
-                             size * sizeof(float));
+  float *data = NULL;
+  int ret =
+      posix_memalign((void **)&data, BLIS_PAGE_SIZE, size * sizeof(float));
 
-    switch (ret) {
-      case 0:
-        return data;
-      case EINVAL:
-        fprintf(stderr, "\033[31mBad alignment in posix_memalign!\033[0m\n");
-      case ENOMEM:
-        fprintf(stderr, "\033[31mNo memory in posix_memalign!\033[0m\n");
-      default:
-        exit(ret);
-    }
+  switch (ret) {
+  case 0:
+    return data;
+  case EINVAL:
+    fprintf(stderr, "\033[31mBad alignment in posix_memalign!\033[0m\n");
+  case ENOMEM:
+    fprintf(stderr, "\033[31mNo memory in posix_memalign!\033[0m\n");
+  default:
+    exit(ret);
+  }
 }
 
 // Packing functions
-static void yaconv_pack(float *src, int rss, int css,
-                        float *dst, int MN, int k, int MNR) {
-     /*  conj_t  conja, \*/
-     /*  pack_t  schema, \*/
-     /*  dim_t   panel_dim, \*/
-     /*  dim_t   panel_dim_max, \*/
-     /*  dim_t   panel_len, \*/
-     /*  dim_t   panel_len_max, \*/
-     /*  ctype*  kappa, \*/
-     /*  ctype*  a, inc_t inca, inc_t lda, \*/
-     /*  ctype*  p,             inc_t ldp, \*/
-     /*  cntx_t* cntx  \*/
-	/*num_t dt     = PASTEMAC(ch,type);*/
+static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
+                        int MNR) {
+  /*  conj_t  conja, \*/
+  /*  pack_t  schema, \*/
+  /*  dim_t   panel_dim, \*/
+  /*  dim_t   panel_dim_max, \*/
+  /*  dim_t   panel_len, \*/
+  /*  dim_t   panel_len_max, \*/
+  /*  ctype*  kappa, \*/
+  /*  ctype*  a, inc_t inca, inc_t lda, \*/
+  /*  ctype*  p,             inc_t ldp, \*/
+  /*  cntx_t* cntx  \*/
+  /*num_t dt     = PASTEMAC(ch,type);*/
 
-  num_t dt = PASTEMAC_(s,type);
-  ukr_t ker_id = bli_is_col_packed( BLIS_PACKED_ROW_PANELS ) ? BLIS_PACKM_NRXK_KER
-                                             : BLIS_PACKM_MRXK_KER;
-  packm_cxk_ker_ft f = bli_cntx_get_ukr_dt( dt, ker_id, cntx );
+  num_t dt = PASTEMAC_(s, type);
+  ukr_t ker_id = bli_is_col_packed(BLIS_PACKED_ROW_PANELS)
+                     ? BLIS_PACKM_NRXK_KER
+                     : BLIS_PACKM_MRXK_KER;
+  packm_cxk_ker_ft f = bli_cntx_get_ukr_dt(dt, ker_id, cntx);
 
   for (int mn = 0; mn < MN; mn += MNR)
     /* If a packing microkernel for this register block size is found,
        use it. Otherwise, use scal2m */
-    f(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
-                   bli_min(MN - mn, MNR), k, k,
-                   bli_s1, src + mn * rss, rss, css,
-                   dst + mn * k, MNR,
-                   cntx);
+    f(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS, bli_min(MN - mn, MNR), k, k,
+      bli_s1, src + mn * rss, rss, css, dst + mn * k, MNR, cntx);
 }
 
 // Extra size functions
@@ -111,8 +108,8 @@ BLIS_EXPORT_ADDON int yaconv_extra_size_before(int FH, int PH, int OW, int M) {
 }
 
 BLIS_EXPORT_ADDON int yaconv_extra_size(int H, int FH, int PH, int OW, int M) {
-  return yaconv_extra_size_before(FH, PH, OW, M)
-         + yaconv_extra_size_after(H, FH, PH, OW, M);
+  return yaconv_extra_size_before(FH, PH, OW, M) +
+         yaconv_extra_size_after(H, FH, PH, OW, M);
 }
 
 // The main yaconv function that computes convolution on a signle image
@@ -141,8 +138,8 @@ static void yaconv_single_image(float *image, int H, int W, int C,
         for (int kc = 0; kc < FW * C; kc += KC) {
 
           int kc_curr = bli_min(FW * C - kc, KC);
-          yaconv_pack(filter + (fh * FW * C + kc) * M + m, 1, M,
-                      filter_buf, mc_curr, kc_curr, MR);
+          yaconv_pack(filter + (fh * FW * C + kc) * M + m, 1, M, filter_buf,
+                      mc_curr, kc_curr, MR);
 
           for (int nr = 0; nr < nc_curr; nr += NR) {
             for (int ow = 0; ow < OW; ++ow) {
@@ -165,13 +162,12 @@ static void yaconv_single_image(float *image, int H, int W, int C,
 
               for (int mr = 0; mr < mc_curr; mr += MR) {
                 if (mr + MR <= mc_curr)
-                  sgemm_ukr(MR, NR, K, bli_s1, ar, br,
-                            bli_s1, cr, 1, OW * M);
+                  sgemm_ukr(MR, NR, K, bli_s1, ar, br, bli_s1, cr, 1, OW * M);
                 else {
-                  sgemm_ukr(MR, NR, K, bli_s1, ar, br,
-                            bli_s0, output_buf, NR, 1);
-                  bli_sxpbys_mxn(mc_curr - mr, NR, output_buf, NR, 1,
-                                 bli_s1, cr, 1, OW * M);
+                  sgemm_ukr(MR, NR, K, bli_s1, ar, br, bli_s0, output_buf, NR,
+                            1);
+                  bli_sxpbys_mxn(mc_curr - mr, NR, output_buf, NR, 1, bli_s1,
+                                 cr, 1, OW * M);
                 }
 
                 ar += MR * kc_curr;
@@ -208,12 +204,14 @@ static void yaconv_init_once(int W, int FW, int C) {
   NC += (NC % NR) ? NR - NC % NR : 0;
   KC = bli_min(FW * C, KC); // to use less buffer space for small inputs
 
-  // printf("MR = %d, NR = %d, MC = %d, KC = %d, NC = %d\n", MR, NR, MC, KC, NC);
+  // printf("MR = %d, NR = %d, MC = %d, KC = %d, NC = %d\n", MR, NR, MC, KC,
+  // NC);
 
   // Compute buffer offsets
   int page_size_minus_one = BLIS_PAGE_SIZE * sizeof(float) - 1;
   int image_buf_off = (MC * KC + page_size_minus_one) & ~page_size_minus_one;
-  int output_buf_off = (W * C * NC + page_size_minus_one) & ~page_size_minus_one;
+  int output_buf_off =
+      (W * C * NC + page_size_minus_one) & ~page_size_minus_one;
 
   // Allocate buffer space
   filter_buf = aligned_alloc(image_buf_off + output_buf_off + MR * NR);
@@ -235,8 +233,8 @@ BLIS_EXPORT_ADDON void yaconv(float **images, int N, int H, int W, int C,
 
   // Run yaconv on each image
   for (int i = 0; i < N; ++i)
-    yaconv_single_image(images[i], H, W, C, filter, FH, FW, M,
-                        outputs[i], PH, PW);
+    yaconv_single_image(images[i], H, W, C, filter, FH, FW, M, outputs[i], PH,
+                        PW);
 
   yaconv_deinit();
 }
