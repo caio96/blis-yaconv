@@ -96,7 +96,9 @@ static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
 
 // Extra size functions
 static int yaconv_extra_size_after(int H, int FH, int PH, int OW, int M) {
-  cntx_t *cntx = bli_gks_query_cntx();
+  if (cntx == NULL)
+    cntx = (cntx_t *)bli_gks_query_cntx();
+
   int NR = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_NR, cntx);
   int extra_h = H % NR ? NR - H % NR : 0;
 
@@ -188,7 +190,9 @@ static void yaconv_init_once(int W, int FW, int C) {
     return;
 
   // Fetch BLIS structures
-  cntx = bli_gks_query_cntx();
+  if (cntx == NULL)
+    cntx = (cntx_t *)bli_gks_query_cntx();
+
   auxinfo = (auxinfo_t *)malloc(sizeof(auxinfo_t));
 
   // Get blocksizes
@@ -233,7 +237,7 @@ BLIS_EXPORT_ADDON void yaconv(float *images, int N, int H, int W, int C,
 
   int OH = H + 2 * PH - FH;
   int OW = W + 2 * PW - FW;
-  int extra_size =  yaconv_extra_size(H, FH, PH, OW, M);
+  int extra_size = yaconv_extra_size(H, FH, PH, OW, M);
 
   // Run yaconv on each image
   for (int i = 0; i < N; ++i)
