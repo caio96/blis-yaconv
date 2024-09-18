@@ -36,15 +36,10 @@
 
 #include "blis.h"
 
-// BLIS structures, block sizes and buffers
-static cntx_t *cntx = NULL;
-static auxinfo_t *auxinfo = NULL;
-static int MR, NR, MC, KC, NC;
-static float *filter_buf = NULL, *image_buf = NULL, *output_buf = NULL;
-
 // GEMM microkernel
 static void sgemm_ukr(int mr, int nr, int k, float *alpha, float *a, float *b,
-                      float *beta, float *c, int rsc, int csc) {
+                      float *beta, float *c, int rsc, int csc,
+                      auxinfo_t *auxinfo, const cntx_t *cntx) {
   bli_sgemm_ukernel(mr, nr, k, alpha, a, b, beta, c, rsc, csc, auxinfo, cntx);
 }
 
@@ -68,19 +63,7 @@ static float *aligned_alloc(int size) {
 
 // Packing functions
 static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
-                        int MNR) {
-  /*  conj_t  conja, \*/
-  /*  pack_t  schema, \*/
-  /*  dim_t   panel_dim, \*/
-  /*  dim_t   panel_dim_max, \*/
-  /*  dim_t   panel_len, \*/
-  /*  dim_t   panel_len_max, \*/
-  /*  ctype*  kappa, \*/
-  /*  ctype*  a, inc_t inca, inc_t lda, \*/
-  /*  ctype*  p,             inc_t ldp, \*/
-  /*  cntx_t* cntx  \*/
-  /*num_t dt     = PASTEMAC(ch,type);*/
-
+                        int MNR, const cntx_t *cntx) {
   num_t dt = PASTEMAC_(s, type);
   ukr_t ker_id = bli_is_col_packed(BLIS_PACKED_ROW_PANELS)
                      ? BLIS_PACKM_NRXK_KER
@@ -95,7 +78,8 @@ static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
 }
 
 // Extra size functions
-static int yaconv_extra_size_after(int H, int FH, int PH, int OW, int M) {
+static int yaconv_extra_size_after(int H, int FH, int PH, int OW, int M,
+                                   cntx_t *cntx) {
   if (cntx == NULL)
     cntx = (cntx_t *)bli_gks_query_cntx();
 
@@ -109,15 +93,19 @@ BLIS_EXPORT_ADDON int yaconv_extra_size_before(int FH, int PH, int OW, int M) {
   return bli_max(0, FH - 1 - PH) * OW * M;
 }
 
-BLIS_EXPORT_ADDON int yaconv_extra_size(int H, int FH, int PH, int OW, int M) {
+BLIS_EXPORT_ADDON int yaconv_extra_size(int H, int FH, int PH, int OW, int M,
+                                        cntx_t *cntx) {
   return yaconv_extra_size_before(FH, PH, OW, M) +
-         yaconv_extra_size_after(H, FH, PH, OW, M);
+         yaconv_extra_size_after(H, FH, PH, OW, M, cntx);
 }
 
 // The main yaconv function that computes convolution on a signle image
 static void yaconv_single_image(float *image, int H, int W, int C,
                                 float *filter, int FH, int FW, int M,
-                                float *output, int PH, int PW) {
+                                float *output, int PH, int PW, int MC, int NC,
+                                int KC, int MR, int NR, float *image_buf,
+                                float *filter_buf, float *output_buf,
+                                auxinfo_t *auxinfo, const cntx_t *cntx) {
 
   // First, compute the spatial width of the output
   const int OH = H + 2 * PH - FH + 1;
@@ -130,7 +118,8 @@ static void yaconv_single_image(float *image, int H, int W, int C,
 
     int nc_curr = bli_min(H - nc, NC);
 
-    yaconv_pack(image + nc * W * C, W * C, 1, image_buf, nc_curr, W * C, NR);
+    yaconv_pack(image + nc * W * C, W * C, 1, image_buf, nc_curr, W * C, NR,
+                cntx);
 
     for (int fh = 0; fh < FH; ++fh) {
       for (int m = 0; m < M; m += MC) {
@@ -141,7 +130,7 @@ static void yaconv_single_image(float *image, int H, int W, int C,
 
           int kc_curr = bli_min(FW * C - kc, KC);
           yaconv_pack(filter + (fh * FW * C + kc) * M + m, 1, M, filter_buf,
-                      mc_curr, kc_curr, MR);
+                      mc_curr, kc_curr, MR, cntx);
 
           for (int nr = 0; nr < nc_curr; nr += NR) {
             for (int ow = 0; ow < OW; ++ow) {
@@ -164,10 +153,11 @@ static void yaconv_single_image(float *image, int H, int W, int C,
 
               for (int mr = 0; mr < mc_curr; mr += MR) {
                 if (mr + MR <= mc_curr)
-                  sgemm_ukr(MR, NR, K, bli_s1, ar, br, bli_s1, cr, 1, OW * M);
+                  sgemm_ukr(MR, NR, K, bli_s1, ar, br, bli_s1, cr, 1, OW * M,
+                            auxinfo, cntx);
                 else {
                   sgemm_ukr(MR, NR, K, bli_s1, ar, br, bli_s0, output_buf, NR,
-                            1);
+                            1, auxinfo, cntx);
                   bli_sxpbys_mxn(mc_curr - mr, NR, output_buf, NR, 1, bli_s1,
                                  cr, 1, OW * M);
                 }
@@ -183,33 +173,27 @@ static void yaconv_single_image(float *image, int H, int W, int C,
   }
 }
 
-// This function performs intitialization of BLIS structures, block sizes and
-// buffer allocation, then calls yaconv implementation for each image
-static void yaconv_init_once(int W, int FW, int C) {
-  if (filter_buf != NULL)
-    return;
-
-  // Fetch BLIS structures
+void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
+               int FW, int M, float *outputs, int PH, int PW, cntx_t *cntx) {
+  // Get valid context
   if (cntx == NULL)
     cntx = (cntx_t *)bli_gks_query_cntx();
 
-  auxinfo = (auxinfo_t *)malloc(sizeof(auxinfo_t));
+  // Allocate auxiliary buffer once
+  auxinfo_t *auxinfo = (auxinfo_t *)malloc(sizeof(auxinfo_t));
 
   // Get blocksizes
-  MR = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_MR, cntx);
-  NR = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_NR, cntx);
-  MC = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_MC, cntx);
-  KC = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_KC, cntx);
-  NC = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_NC, cntx);
+  int MR = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_MR, cntx);
+  int NR = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_NR, cntx);
+  int MC = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_MC, cntx);
+  int KC = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_KC, cntx);
+  int NC = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_NC, cntx);
 
   // Adjust NC at run-time so that the packed image buffer fits in L3 and
   // NC is the nearest multiple of NR greater than NC in BLIS
   NC = KC * NC / W / C;
   NC += (NC % NR) ? NR - NC % NR : 0;
   KC = bli_min(FW * C, KC); // to use less buffer space for small inputs
-
-  // printf("MR = %d, NR = %d, MC = %d, KC = %d, NC = %d\n", MR, NR, MC, KC,
-  // NC);
 
   // Compute buffer offsets
   int page_size_minus_one = BLIS_PAGE_SIZE * sizeof(float) - 1;
@@ -218,33 +202,27 @@ static void yaconv_init_once(int W, int FW, int C) {
       (W * C * NC + page_size_minus_one) & ~page_size_minus_one;
 
   // Allocate buffer space
-  filter_buf = aligned_alloc(image_buf_off + output_buf_off + MR * NR);
-  image_buf = filter_buf + image_buf_off;
-  output_buf = image_buf + output_buf_off;
-}
-
-static void yaconv_deinit() {
-  // All buffers are actually at different offsets within one
-  free(filter_buf);
-  filter_buf = NULL;
-  free(auxinfo);
-}
-
-// This function performs intitialization of BLIS structures, block sizes and
-// buffer allocation, then calls yaconv implementation for each image
-BLIS_EXPORT_ADDON void yaconv(float *images, int N, int H, int W, int C,
-                              float *filter, int FH, int FW, int M,
-                              float *outputs, int PH, int PW) {
-  yaconv_init_once(W, FW, C);
+  float *filter_buf = aligned_alloc(image_buf_off + output_buf_off + MR * NR);
+  float *image_buf = filter_buf + image_buf_off;
+  float *output_buf = image_buf + output_buf_off;
 
   int OH = H + 2 * PH - FH;
   int OW = W + 2 * PW - FW;
-  int extra_size = yaconv_extra_size(H, FH, PH, OW, M);
+  int extra_size = yaconv_extra_size(H, FH, PH, OW, M, cntx);
 
   // Run yaconv on each image
   for (int i = 0; i < N; ++i)
     yaconv_single_image(&images[i * H * W * C], H, W, C, filter, FH, FW, M,
-                        &outputs[i * (OH * OW * M + extra_size)], PH, PW);
+                        &outputs[i * (OH * OW * M + extra_size)], PH, PW, MC,
+                        NC, KC, MR, NR, image_buf, filter_buf, output_buf,
+                        auxinfo, cntx);
 
-  yaconv_deinit();
+  // All buffers are actually at different offsets within one
+  free(filter_buf);
+  free(auxinfo);
+}
+
+void yaconv(float *images, int N, int H, int W, int C, float *filter, int FH,
+            int FW, int M, float *outputs, int PH, int PW) {
+  yaconv_ex(images, N, H, W, C, filter, FH, FW, M, outputs, PH, PW, NULL);
 }
