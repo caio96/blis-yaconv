@@ -78,7 +78,7 @@ static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
 }
 
 // Extra size functions
-static int yaconv_extra_size_after(int H, int FH, int PH, int OW, int M,
+BLIS_EXPORT_ADDON int yaconv_extra_size_after(int H, int FH, int PH, int OW, int M,
                                    cntx_t *cntx) {
   if (cntx == NULL)
     cntx = (cntx_t *)bli_gks_query_cntx();
@@ -206,8 +206,8 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
   float *image_buf = filter_buf + image_buf_off;
   float *output_buf = image_buf + output_buf_off;
 
-  int OH = H + 2 * PH - FH;
-  int OW = W + 2 * PW - FW;
+  int OH = H + 2 * PH - FH + 1;
+  int OW = W + 2 * PW - FW + 1;
   int extra_size = yaconv_extra_size(H, FH, PH, OW, M, cntx);
 
   // Run yaconv on each image

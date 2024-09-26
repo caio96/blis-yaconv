@@ -36,6 +36,7 @@
 #ifndef YACONV_H
 #define YACONV_H
 
+BLIS_EXPORT_ADDON int yaconv_extra_size_after(int H, int FH, int PH, int OW, int M, cntx_t *cntx);
 BLIS_EXPORT_ADDON int yaconv_extra_size_before(int FH, int PH, int OW, int M);
 BLIS_EXPORT_ADDON int yaconv_extra_size(int H, int FH, int PH, int OW, int M, cntx_t *cntx);
 
