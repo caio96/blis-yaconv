@@ -209,15 +209,23 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
   int OH = H + 2 * PH - FH + 1;
   int OW = W + 2 * PW - FW + 1;
   int extra_size = yaconv_extra_size(H, FH, PH, OW, M, cntx);
+  int extra_before = yaconv_extra_size_before(FH, PH, OW, M);
+
+  float *single_output = aligned_alloc(OH * OW * M + extra_size);
 
   // Run yaconv on each image
-  for (int i = 0; i < N; ++i)
+  for (int i = 0; i < N; ++i) {
     yaconv_single_image(&images[i * H * W * C], H, W, C, filter, FH, FW, M,
-                        &outputs[i * (OH * OW * M + extra_size)], PH, PW, MC,
+                        single_output, PH, PW, MC,
                         NC, KC, MR, NR, image_buf, filter_buf, output_buf,
                         auxinfo, cntx);
+    // Convert single output to NHWC
+    for (int j = 0; j < OH * OW * M; ++j) {
+      outputs[i * OH * OW * M + j] = single_output[j+extra_before];
+    }
+  }
 
-  // All buffers are actually at different offsets within one
+  free(single_output);
   free(filter_buf);
   free(auxinfo);
 }
