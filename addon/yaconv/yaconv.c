@@ -36,13 +36,6 @@
 
 #include "blis.h"
 
-// GEMM microkernel
-static void sgemm_ukr(int mr, int nr, int k, float *alpha, float *a, float *b,
-                      float *beta, float *c, int rsc, int csc,
-                      auxinfo_t *auxinfo, const cntx_t *cntx) {
-  bli_sgemm_ukernel(mr, nr, k, alpha, a, b, beta, c, rsc, csc, auxinfo, cntx);
-}
-
 // Convenience page-aligned alloc with return check
 static float *aligned_alloc(int size) {
   float *data = NULL;
@@ -61,7 +54,7 @@ static float *aligned_alloc(int size) {
   }
 }
 
-// Packing functions
+// Packing function
 static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
                         int MNR, const cntx_t *cntx) {
   num_t dt = PASTEMAC_(s, type);
@@ -71,32 +64,21 @@ static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
   packm_cxk_ker_ft f = bli_cntx_get_ukr_dt(dt, ker_id, cntx);
 
   for (int mn = 0; mn < MN; mn += MNR)
-    /* If a packing microkernel for this register block size is found,
-       use it. Otherwise, use scal2m */
     f(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS, bli_min(MN - mn, MNR), k, k,
       bli_s1, src + mn * rss, rss, css, dst + mn * k, MNR, cntx);
 }
 
 // Extra size functions
-BLIS_EXPORT_ADDON int yaconv_extra_size_after(int H, int FH, int PH, int OW, int M,
-                                   cntx_t *cntx) {
-  if (cntx == NULL)
-    cntx = (cntx_t *)bli_gks_query_cntx();
-
+int yaconv_extra_size_after(int H, int FH, int PH, int OW, int M,
+                            const cntx_t *cntx) {
   int NR = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_NR, cntx);
   int extra_h = H % NR ? NR - H % NR : 0;
 
   return bli_max(0, extra_h + FH - 1 - PH) * OW * M;
 }
 
-BLIS_EXPORT_ADDON int yaconv_extra_size_before(int FH, int PH, int OW, int M) {
+int yaconv_extra_size_before(int FH, int PH, int OW, int M) {
   return bli_max(0, FH - 1 - PH) * OW * M;
-}
-
-BLIS_EXPORT_ADDON int yaconv_extra_size(int H, int FH, int PH, int OW, int M,
-                                        cntx_t *cntx) {
-  return yaconv_extra_size_before(FH, PH, OW, M) +
-         yaconv_extra_size_after(H, FH, PH, OW, M, cntx);
 }
 
 // The main yaconv function that computes convolution on a signle image
@@ -153,11 +135,11 @@ static void yaconv_single_image(float *image, int H, int W, int C,
 
               for (int mr = 0; mr < mc_curr; mr += MR) {
                 if (mr + MR <= mc_curr)
-                  sgemm_ukr(MR, NR, K, bli_s1, ar, br, bli_s1, cr, 1, OW * M,
-                            auxinfo, cntx);
+                  bli_sgemm_ukernel(MR, NR, K, bli_s1, ar, br, bli_s1, cr, 1,
+                                    OW * M, auxinfo, cntx);
                 else {
-                  sgemm_ukr(MR, NR, K, bli_s1, ar, br, bli_s0, output_buf, NR,
-                            1, auxinfo, cntx);
+                  bli_sgemm_ukernel(MR, NR, K, bli_s1, ar, br, bli_s0,
+                                    output_buf, NR, 1, auxinfo, cntx);
                   bli_sxpbys_mxn(mc_curr - mr, NR, output_buf, NR, 1, bli_s1,
                                  cr, 1, OW * M);
                 }
@@ -208,23 +190,24 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
 
   int OH = H + 2 * PH - FH + 1;
   int OW = W + 2 * PW - FW + 1;
-  int extra_size = yaconv_extra_size(H, FH, PH, OW, M, cntx);
   int extra_before = yaconv_extra_size_before(FH, PH, OW, M);
+  int extra_after = yaconv_extra_size_after(H, FH, PH, OW, M, cntx);
 
-  float *single_output = aligned_alloc(OH * OW * M + extra_size);
+  float *single_output =
+      aligned_alloc(OH * OW * M + extra_before + extra_after);
 
   // Run yaconv on each image
   for (int i = 0; i < N; ++i) {
     yaconv_single_image(&images[i * H * W * C], H, W, C, filter, FH, FW, M,
-                        single_output, PH, PW, MC,
-                        NC, KC, MR, NR, image_buf, filter_buf, output_buf,
-                        auxinfo, cntx);
+                        single_output, PH, PW, MC, NC, KC, MR, NR, image_buf,
+                        filter_buf, output_buf, auxinfo, cntx);
     // Convert single output to NHWC
     for (int j = 0; j < OH * OW * M; ++j) {
-      outputs[i * OH * OW * M + j] = single_output[j+extra_before];
+      outputs[i * OH * OW * M + j] = single_output[j + extra_before];
     }
   }
 
+  // Deallocate buffers
   free(single_output);
   free(filter_buf);
   free(auxinfo);

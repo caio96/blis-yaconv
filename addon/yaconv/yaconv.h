@@ -6,6 +6,7 @@
 
    Copyright (C) 2014, The University of Texas at Austin
    Copyright (C) 2018 - 2019, Advanced Micro Devices, Inc.
+   Copyright (C) 2021 - 2022, Ivan Korostelev
 
    Redistribution and use in source and binary forms, with or without
    modification, are permitted provided that the following conditions are
@@ -35,10 +36,6 @@
 
 #ifndef YACONV_H
 #define YACONV_H
-
-BLIS_EXPORT_ADDON int yaconv_extra_size_after(int H, int FH, int PH, int OW, int M, cntx_t *cntx);
-BLIS_EXPORT_ADDON int yaconv_extra_size_before(int FH, int PH, int OW, int M);
-BLIS_EXPORT_ADDON int yaconv_extra_size(int H, int FH, int PH, int OW, int M, cntx_t *cntx);
 
 BLIS_EXPORT_ADDON void yaconv(float *images, int N, int H, int W, int C,
                               float *filter, int FH, int FW, int M,
