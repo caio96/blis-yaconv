@@ -54,6 +54,19 @@ static float *aligned_alloc(int size) {
   }
 }
 
+// Offset required after the output image
+static int yaconv_extra_size_after(int H, int FH, int PH, int OW, int M,
+                                   const cntx_t *cntx) {
+  int NR = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_NR, cntx);
+  int extra_h = H % NR ? NR - H % NR : 0;
+  return bli_max(0, extra_h + FH - 1 - PH) * OW * M;
+}
+
+// Offset required before the output image
+static int yaconv_extra_size_before(int FH, int PH, int OW, int M) {
+  return bli_max(0, FH - 1 - PH) * OW * M;
+}
+
 // Packing function
 static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
                         int MNR, const cntx_t *cntx) {
@@ -68,20 +81,7 @@ static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
       bli_s1, src + mn * rss, rss, css, dst + mn * k, MNR, cntx);
 }
 
-// Extra size functions
-int yaconv_extra_size_after(int H, int FH, int PH, int OW, int M,
-                            const cntx_t *cntx) {
-  int NR = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_NR, cntx);
-  int extra_h = H % NR ? NR - H % NR : 0;
-
-  return bli_max(0, extra_h + FH - 1 - PH) * OW * M;
-}
-
-int yaconv_extra_size_before(int FH, int PH, int OW, int M) {
-  return bli_max(0, FH - 1 - PH) * OW * M;
-}
-
-// The main yaconv function that computes convolution on a signle image
+// The main yaconv function that computes convolution on a single image
 static void yaconv_single_image(float *image, int H, int W, int C,
                                 float *filter, int FH, int FW, int M,
                                 float *output, int PH, int PW, int MC, int NC,
@@ -164,7 +164,7 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
   // Allocate auxiliary buffer once
   auxinfo_t *auxinfo = (auxinfo_t *)malloc(sizeof(auxinfo_t));
 
-  // Get blocksizes
+  // Get block sizes
   int MR = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_MR, cntx);
   int NR = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_NR, cntx);
   int MC = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_MC, cntx);
