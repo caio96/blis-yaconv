@@ -165,7 +165,7 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
   if (cntx == NULL)
     cntx = (cntx_t *)bli_gks_query_cntx();
 
-  // Allocate auxiliary buffer once
+  // Allocate memory for auxiliary buffers
   auxinfo_t *auxinfo = (auxinfo_t *)malloc(sizeof(auxinfo_t));
 
   // Get block sizes
@@ -181,8 +181,11 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
   NC += (NC % NR) ? NR - NC % NR : 0;
   KC = bli_min(FW * C, KC); // to use less buffer space for small inputs
 
+  // Output dimensions
   int OH = H + 2 * PH - FH + 1;
   int OW = W + 2 * PW - FW + 1;
+
+  // Extra offset required by yaconv
   int extra_before = yaconv_extra_size_before(FH, PH, OW, M);
   int extra_after = yaconv_extra_size_after(H, FH, PH, OW, M, cntx);
 
@@ -190,11 +193,12 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
   int image_buf_off = align_to(MC * KC, BLIS_PAGE_SIZE);
   int output_buf_off = align_to(W * C * NC, BLIS_PAGE_SIZE);
 
-  // Allocate buffer space
+  // Allocate memory for filter, image, and output buffers
   float *filter_buf = aligned_alloc(MR * NR + image_buf_off + output_buf_off);
   float *image_buf = filter_buf + image_buf_off;
   float *output_buf = image_buf + output_buf_off;
 
+  // Allocate memory for single output
   float *single_output =
       aligned_alloc(OH * OW * M + extra_before + extra_after);
 
