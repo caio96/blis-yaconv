@@ -36,11 +36,12 @@
 
 #include "blis.h"
 
+// Align x to the next multiple of align
 static inline int align_to(int x, int align) {
   return (x + align - 1) & ~(align - 1);
 }
 
-// Convenience page-aligned alloc with return check
+// Convenience page-aligned allocation with return check
 static float *aligned_alloc(int size) {
   float *data = NULL;
   int ret =
