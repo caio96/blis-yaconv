@@ -187,14 +187,10 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
   int extra_before = yaconv_extra_size_before(FH, PH, OW, M);
   int extra_after = yaconv_extra_size_after(H, FH, PH, OW, M, cntx);
 
-  // Compute buffer offsets
-  int image_buf_off = align_to(MC * KC, BLIS_PAGE_SIZE);
-  int output_buf_off = align_to(W * C * NC, BLIS_PAGE_SIZE);
-
   // Allocate memory for filter, image, and output buffers
-  float *filter_buf = aligned_alloc(MR * NR + image_buf_off + output_buf_off);
-  float *image_buf = filter_buf + image_buf_off;
-  float *output_buf = image_buf + output_buf_off;
+  float *filter_buf = aligned_alloc(MC * KC);
+  float *image_buf = aligned_alloc(W * C * NC);
+  float *output_buf = aligned_alloc(MR * NR);
 
   // Allocate memory for single output
   float *single_output =
@@ -214,6 +210,8 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
   // Deallocate buffers
   free(single_output);
   free(filter_buf);
+  free(image_buf);
+  free(output_buf);
   free(auxinfo);
 }
 
