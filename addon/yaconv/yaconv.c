@@ -75,15 +75,12 @@ static int yaconv_extra_size_before(int FH, int PH, int OW, int M) {
 // Packing function
 static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
                         int MNR, const cntx_t *cntx) {
-  num_t dt = PASTEMAC_(s, type);
-  ukr_t ker_id = bli_is_col_packed(BLIS_PACKED_ROW_PANELS)
-                     ? BLIS_PACKM_NRXK_KER
-                     : BLIS_PACKM_MRXK_KER;
-  packm_cxk_ker_ft f = bli_cntx_get_ukr_dt(dt, ker_id, cntx);
-
   for (int mn = 0; mn < MN; mn += MNR)
-    f(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS, bli_min(MN - mn, MNR), k, k,
-      bli_s1, src + mn * rss, rss, css, dst + mn * k, MNR, cntx);
+    bls_spackm_cxk(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
+                   bli_min(MN - mn, MNR), MNR, k, k,
+                   bli_s1, src + mn * rss, rss, css,
+                   dst + mn * k, MNR,
+                   (cntx_t*)cntx);
 }
 
 // The main yaconv function that computes convolution on a single image
