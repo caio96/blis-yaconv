@@ -45,4 +45,13 @@ BLIS_EXPORT_ADDON void yaconv_ex(float *images, int N, int H, int W, int C,
                                  float *filter, int FH, int FW, int M,
                                  float *outputs, int PH, int PW, cntx_t *cntx);
 
+BLIS_EXPORT_ADDON void yaconv_prepack(float *images, int N, int H, int W, int C,
+                              float *filter, int FH, int FW, int M,
+                              float *outputs, int PH, int PW);
+
+BLIS_EXPORT_ADDON void yaconv_ex_prepack(float *images, int N, int H, int W, int C,
+                                 float *filter, int FH, int FW, int M,
+                                 float *outputs, int PH, int PW, cntx_t *cntx);
+
+
 #endif
