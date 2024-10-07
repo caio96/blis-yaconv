@@ -104,8 +104,8 @@ static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
                         int MNR, const cntx_t *cntx) {
   for (int mn = 0; mn < MN; mn += MNR) {
     // under_packing(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
-    //               bli_min(MN - mn, MNr), MNr, k, k, bli_s1, src + mn * rss, rss,
-    //               css, dst + mn * k, MNr, (cntx_t *)cntx);
+    //               bli_min(MN - mn, MNr), MNr, k, k, bli_s1, src + mn * rss,
+    //               rss, css, dst + mn * k, MNr, (cntx_t *)cntx);
     bls_spackm_cxk(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
                    bli_min(MN - mn, MNR), MNR, k, k, bli_s1, src + mn * rss,
                    rss, css, dst + mn * k, MNR, (cntx_t *)cntx);
@@ -289,7 +289,7 @@ static void yaconv_single_image_prepack(float *image, int H, int W, int C,
                                         float *filter, int FH, int FW, int M,
                                         float *output, int PH, int PW, int MC,
                                         int NC, int KC, int MR, int NR,
-                                        float *image_buf, float *filter_buf,
+                                        // float *image_buf, float *filter_buf,
                                         float *output_buf, auxinfo_t *auxinfo,
                                         const cntx_t *cntx) {
 
@@ -304,20 +304,9 @@ static void yaconv_single_image_prepack(float *image, int H, int W, int C,
 
     int nc_curr = bli_min(H - nc, NC);
 
-    // Print packing arguments
-    printf("image packing size: W:%d, C:%d, NC:%d\n", W, C, NC);
-    // yaconv_pack(image + nc * W * C, W * C, 1, image_buf, nc_curr, W * C, NR,
-    //             cntx);
-
-    for (int mn = 0; mn < nc_curr; mn += NR) {
-      under_packing(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
-                    bli_min(nc_curr - mn, NR), NR, W * C, W * C, bli_s1,
-                    image + nc * W * C + mn * W * C, W * C, 1,
-                    image_buf + mn * W * C, NR, (cntx_t *)cntx);
-    }
-
-    // float *image_bufff = image + nc * W * C;
-    // yaconv_copy(image, image_buf, MC*KC);
+    // Prefetch instead of packing
+    float *image_buf = image + nc * W * C;
+    // yaconv_prefetch_read_l3(image_buf, nc_curr * W * C);
 
     for (int fh = 0; fh < FH; ++fh) {
       for (int m = 0; m < M; m += MC) {
@@ -327,11 +316,10 @@ static void yaconv_single_image_prepack(float *image, int H, int W, int C,
         for (int kc = 0; kc < FW * C; kc += KC) {
 
           int kc_curr = bli_min(FW * C - kc, KC);
-          // yaconv_pack(filter + (fh * FW * C + kc) * M + m, 1, M,
-          // filter_buf,
-          //             mc_curr, kc_curr, MR, cntx);
-          // yaconv_copy(filter, filter_buf, MC*KC);
-          // yaconv_prefetch_read_l2(filter, MC*KC);
+
+          // Prefetch instead of packing
+          float *filter_buf = filter + (fh * FW * C + kc) * M + m;
+          // yaconv_prefetch_read_l1(filter_buf, MC * KC);
 
           for (int nr = 0; nr < nc_curr; nr += NR) {
             for (int ow = 0; ow < OW; ++ow) {
@@ -339,7 +327,7 @@ static void yaconv_single_image_prepack(float *image, int H, int W, int C,
               int image_start = (ow - PW) * C + kc;
               int image_end = bli_min(W * C, image_start + kc_curr);
 
-              float *ar = filter + (fh * FW * C + kc) * M + m;
+              float *ar = filter_buf;
               if (image_start < 0) {
                 ar -= image_start * MR;
                 image_start = 0;
@@ -349,18 +337,14 @@ static void yaconv_single_image_prepack(float *image, int H, int W, int C,
               if (K <= 0)
                 continue;
 
-              // printf("image index: %d\n", nc * W * C + nr * W * C + image_start * NR);
-              printf("image buf index: %d\n", nr * W * C + image_start * NR);
               float *br = &image_buf[nr * W * C + image_start * NR];
-              // float *br = image + nc * W * C + nr * W * C + image_start * NR;
               float *cr = output + ((nc + nr - fh + PH) * OW + ow) * M + m;
 
               for (int mr = 0; mr < mc_curr; mr += MR) {
-                if (mr + MR <= mc_curr){
+                if (mr + MR <= mc_curr) {
                   bli_sgemm_ukernel(MR, NR, K, bli_s1, ar, br, bli_s1, cr, 1,
                                     OW * M, auxinfo, cntx);
-                }
-                else {
+                } else {
                   bli_sgemm_ukernel(MR, NR, K, bli_s1, ar, br, bli_s0,
                                     output_buf, NR, 1, auxinfo, cntx);
                   bli_sxpbys_mxn(mc_curr - mr, NR, output_buf, NR, 1, bli_s1,
@@ -412,9 +396,8 @@ void yaconv_ex_prepack(float *images, int N, int H, int W, int C, float *filter,
   int extra_after = yaconv_extra_size_after(H, FH, PH, OW, M, cntx);
 
   // Allocate memory for filter, image, and output buffers
-  float *filter_buf = aligned_alloc(MC * KC);
-  float *image_buf = aligned_alloc(W * C * NC);
-  // float *image_buf =(float *) malloc(W * C * NC * sizeof(float));
+  // float *filter_buf = aligned_alloc(MC * KC);
+  // float *image_buf = aligned_alloc(W * C * NC);
   float *output_buf = aligned_alloc(MR * NR);
 
   // Allocate memory for single output
@@ -425,8 +408,8 @@ void yaconv_ex_prepack(float *images, int N, int H, int W, int C, float *filter,
   for (int i = 0; i < N; ++i) {
     yaconv_single_image_prepack(&images[i * H * W * C], H, W, C, filter, FH, FW,
                                 M, single_output, PH, PW, MC, NC, KC, MR, NR,
-                                image_buf, filter_buf, output_buf, auxinfo,
-                                cntx);
+                                // image_buf, filter_buf,
+                                output_buf, auxinfo, cntx);
     // Convert single output to NHWC
     for (int j = 0; j < OH * OW * M; ++j) {
       outputs[i * OH * OW * M + j] = single_output[j + extra_before];
@@ -435,8 +418,8 @@ void yaconv_ex_prepack(float *images, int N, int H, int W, int C, float *filter,
 
   // Deallocate buffers
   free(single_output);
-  free(filter_buf);
-  free(image_buf);
+  // free(filter_buf);
+  // free(image_buf);
   free(output_buf);
   free(auxinfo);
 }
