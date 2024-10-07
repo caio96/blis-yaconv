@@ -257,6 +257,15 @@ static void yaconv_copy(float *src, float *buf, int size) {
   }
 }
 
+static void yaconv_prefetch_read_l1(float *array, size_t size) {
+  char *char_array = (char *)array;
+  // Assuming cache line size is 64 bytes
+  for (size_t i = 0; i < size; i += 64) {
+    // 0 for write, 3 for L1 cache
+    __builtin_prefetch(&char_array[i], 0, 3);
+  }
+}
+
 static void yaconv_prefetch_read_l2(float *array, size_t size) {
   char *char_array = (char *)array;
   // Assuming cache line size is 64 bytes
