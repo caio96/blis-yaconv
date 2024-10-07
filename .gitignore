@@ -1,4 +1,6 @@
 # -- generic files to ignore --
+.cache
+compile_commands.json
 
 # emacs backup files
 *~
