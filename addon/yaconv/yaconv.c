@@ -76,13 +76,6 @@ void under_packing(conj_t conja, pack_t schema, dim_t panel_dim,
                    dim_t panel_dim_max, dim_t panel_len, dim_t panel_len_max,
                    float *kappa, float *a, inc_t inca, inc_t lda, float *p,
                    inc_t ldp, cntx_t *cntx) {
-
-  // Print function arguments
-  printf(
-      "panel_dim: %ld, panel_dim_max: %ld, panel_len: %ld, panel_len_max: %ld, "
-      "inca: %ld, lda: %ld, ldp: %ld\n",
-      panel_dim, panel_dim_max, panel_len, panel_len_max, inca, lda, ldp);
-
   for (dim_t l = 0; l < panel_len; ++l) {
     for (dim_t i = 0; i < panel_dim; ++i) {
       float *ali = a + l * lda + i * inca;
@@ -108,17 +101,14 @@ void under_packing(conj_t conja, pack_t schema, dim_t panel_dim,
 
 // Packing function
 static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
-                        int MNr, const cntx_t *cntx) {
-  // Print function arguments
-  printf("rss: %d, css: %d, MN: %d, k: %d, MNR: %d\n", rss, css, MN, k, MNr);
-
-  for (int mn = 0; mn < MN; mn += MNr) {
-    under_packing(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
-                  bli_min(MN - mn, MNr), MNr, k, k, bli_s1, src + mn * rss, rss,
-                  css, dst + mn * k, MNr, (cntx_t *)cntx);
-    // bls_spackm_cxk(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
-    //                bli_min(MN - mn, MNR), MNR, k, k, bli_s1, src + mn * rss,
-    //                rss, css, dst + mn * k, MNR, (cntx_t *)cntx);
+                        int MNR, const cntx_t *cntx) {
+  for (int mn = 0; mn < MN; mn += MNR) {
+    // under_packing(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
+    //               bli_min(MN - mn, MNr), MNr, k, k, bli_s1, src + mn * rss, rss,
+    //               css, dst + mn * k, MNr, (cntx_t *)cntx);
+    bls_spackm_cxk(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
+                   bli_min(MN - mn, MNR), MNR, k, k, bli_s1, src + mn * rss,
+                   rss, css, dst + mn * k, MNR, (cntx_t *)cntx);
   }
 }
 
@@ -280,7 +270,7 @@ static void yaconv_prefetch_read_l3(float *array, size_t size) {
   char *char_array = (char *)array;
   // Assuming cache line size is 64 bytes
   for (size_t i = 0; i < size; i += 64) {
-    // 0 for write, 2 for L2 cache
+    // 0 for write, 1 for L3 cache
     __builtin_prefetch(&char_array[i], 0, 1);
   }
 }
@@ -407,8 +397,6 @@ void yaconv_ex_prepack(float *images, int N, int H, int W, int C, float *filter,
   // Output dimensions
   int OH = H + 2 * PH - FH + 1;
   int OW = W + 2 * PW - FW + 1;
-
-  printf("image size: %d\n", N*C*W*H);
 
   // Extra offset required by yaconv
   int extra_before = yaconv_extra_size_before(FH, PH, OW, M);
