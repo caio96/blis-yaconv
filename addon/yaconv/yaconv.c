@@ -304,9 +304,9 @@ static void yaconv_single_image_prepack(float *image, int H, int W, int C,
 
     int nc_curr = bli_min(H - nc, NC);
 
-    // Prefetch instead of packing
+    // yaconv_pack(image + nc * W * C, W * C, 1, image_buf, nc_curr, W * C, NR,
+    //             cntx);
     float *image_buf = image + nc * W * C;
-    // yaconv_prefetch_read_l3(image_buf, nc_curr * W * C);
 
     for (int fh = 0; fh < FH; ++fh) {
       for (int m = 0; m < M; m += MC) {
@@ -317,9 +317,9 @@ static void yaconv_single_image_prepack(float *image, int H, int W, int C,
 
           int kc_curr = bli_min(FW * C - kc, KC);
 
-          // Prefetch instead of packing
+          // yaconv_pack(filter + (fh * FW * C + kc) * M + m, 1, M, filter_buf,
+          //             mc_curr, kc_curr, MR, cntx);
           float *filter_buf = filter + (fh * FW * C + kc) * M + m;
-          // yaconv_prefetch_read_l1(filter_buf, MC * KC);
 
           for (int nr = 0; nr < nc_curr; nr += NR) {
             for (int ow = 0; ow < OW; ++ow) {
@@ -337,14 +337,14 @@ static void yaconv_single_image_prepack(float *image, int H, int W, int C,
               if (K <= 0)
                 continue;
 
-              float *br = &image_buf[nr * W * C + image_start * NR];
+              float *br = image_buf + nr * W * C + image_start * NR;
               float *cr = output + ((nc + nr - fh + PH) * OW + ow) * M + m;
 
               for (int mr = 0; mr < mc_curr; mr += MR) {
-                if (mr + MR <= mc_curr) {
+                if (mr + MR <= mc_curr)
                   bli_sgemm_ukernel(MR, NR, K, bli_s1, ar, br, bli_s1, cr, 1,
                                     OW * M, auxinfo, cntx);
-                } else {
+                else {
                   bli_sgemm_ukernel(MR, NR, K, bli_s1, ar, br, bli_s0,
                                     output_buf, NR, 1, auxinfo, cntx);
                   bli_sxpbys_mxn(mc_curr - mr, NR, output_buf, NR, 1, bli_s1,
