@@ -214,6 +214,7 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
   int NC = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_NC, cntx);
 
   // TODO: NC could be smaller for the input 1, 64, 64, 64, 128, 3, 3
+  // TODO: NC blows up for input 1,1,3,3,1,2,2,1,1,0,0
   //
   // Adjust NC at run-time so that the packed image buffer fits in L3 and
   // NC is the nearest multiple of NR greater than NC in BLIS
@@ -352,6 +353,8 @@ static void yaconv_single_image_prepack(float *image, int H, int W, int C,
               float *cr = output + ((nc + nr - fh + PH) * OW + ow) * M + m;
 
               for (int mr = 0; mr < mc_curr; mr += MR) {
+                // TODO: check if output_buf could store the output of this gemm
+                // and throw away spill over results when copying to cr
                 if (mr + MR <= mc_curr)
                   bli_sgemm_ukernel(MR, NR, K, bli_s1, ar, br, bli_s1, cr, 1,
                                     OW * M, auxinfo, cntx);
@@ -391,6 +394,7 @@ void yaconv_ex_prepack(float *images, int N, int H, int W, int C, float *filter,
   int NC = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_NC, cntx);
 
   // TODO: NC could be smaller for the input 1, 64, 64, 64, 128, 3, 3
+  // TODO: NC blows up for input 1,1,3,3,1,2,2,1,1,0,0
   //
   // Adjust NC at run-time so that the packed image buffer fits in L3 and
   // NC is the nearest multiple of NR greater than NC in BLIS
