@@ -72,6 +72,15 @@ static int yaconv_extra_size_before(int FH, int PH, int OW, int M) {
   return bli_max(0, FH - 1 - PH) * OW * M;
 }
 
+// a: input matrix
+// p: packed output
+// panel_dim: the innermost dimension of the panel
+// panel_len: the outermost dimension of the panel
+//   if these dimensions are less than the maximum,
+//   the rest of the panel is zeroed
+// inca: the stride of the matrix a
+// lda: the leading dimension of the matrix a
+// ldp: the leading dimension of the panel
 void under_packing(conj_t conja, pack_t schema, dim_t panel_dim,
                    dim_t panel_dim_max, dim_t panel_len, dim_t panel_len_max,
                    float *kappa, float *a, inc_t inca, inc_t lda, float *p,
@@ -124,6 +133,8 @@ static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
 }
 
 // The main yaconv function that computes convolution on a single image
+// Image is in NHWC format
+// Filter is in HWCM format
 static void yaconv_single_image(float *image, int H, int W, int C,
                                 float *filter, int FH, int FW, int M,
                                 float *output, int PH, int PW, int MC, int NC,
@@ -135,36 +146,71 @@ static void yaconv_single_image(float *image, int H, int W, int C,
   const int OH = H + 2 * PH - FH + 1;
   const int OW = W + 2 * PW - FW + 1;
 
+  // Skip extra offset at the start of the output
   output += yaconv_extra_size_before(FH, PH, OW, M);
+  // Initialize output to zeros
   bli_ssetv(BLIS_NO_CONJUGATE, OH * OW * M, bli_s0, output, 1);
 
+  // NC divides the image height into block
   for (int nc = 0; nc < H; nc += NC) {
-
+    // Get block of size NC, or, if the last block is smaller, the remaining
     int nc_curr = bli_min(H - nc, NC);
 
-    yaconv_pack(image + nc * W * C, W * C, 1, image_buf, nc_curr, W * C, NR,
-                cntx);
+    // Pack block of the image of size W*C x nc_curr
+    // where nc_curr is divided into blocks of size NR.
+    // This packing transposes the image (inca is not 1)
+    // yaconv_pack(&image[nc * W * C], W * C, 1, image_buf, nc_curr, W * C, NR,
+    //             cntx);
+    for (int nr = 0; nr < nc_curr; nr += NR) {
+      under_packing(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
+                    bli_min(nc_curr - nr, NR), NR, W * C, W * C, bli_s1,
+                    &image[(nc + nr) * W * C], W * C, 1, &image_buf[nr * W * C],
+                    NR, (cntx_t *)cntx);
+    }
 
+    // For every element in the filter height
     for (int fh = 0; fh < FH; ++fh) {
-      for (int m = 0; m < M; m += MC) {
 
-        int mc_curr = bli_min(M - m, MC);
+      // MC divides the number of output channels into blocks
+      for (int mc = 0; mc < M; mc += MC) {
+        // Get block of size MC, or, if the last block is smaller, the remaining
+        int mc_curr = bli_min(M - mc, MC);
 
+        // TODO: check if the kc loop should be moved outside the mc loop
+        //       because M is the innermost dimension of the filter
+        //
+        // KC divides the filter width times input channels into blocks
         for (int kc = 0; kc < FW * C; kc += KC) {
-
+          // Get block of size KC, or, if the last block is smaller, the
+          // remaining
           int kc_curr = bli_min(FW * C - kc, KC);
-          yaconv_pack(filter + (fh * FW * C + kc) * M + m, 1, M, filter_buf,
-                      mc_curr, kc_curr, MR, cntx);
 
+          // Pack block of the filter of size kc_curr x mc_curr
+          // where mc_curr is divided into blocks of size MR.
+          // yaconv_pack(&filter[(fh * FW * C + kc) * M + mc], 1, M, filter_buf,
+          //             mc_curr, kc_curr, MR, cntx);
+          for (int mr = 0; mr < mc_curr; mr += MR) {
+            under_packing(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
+                          bli_min(mc_curr - mr, MR), MR, kc_curr, kc_curr,
+                          bli_s1, &filter[(fh * FW * C + kc) * M + mc + mr], 1,
+                          M, &filter_buf[mr * kc_curr], MR, (cntx_t *)cntx);
+          }
+
+          // NR subdivides the block of size NC into smaller blocks
           for (int nr = 0; nr < nc_curr; nr += NR) {
+            int oh = nc + nr - fh + PH;
+
+            // For every output width element
             for (int ow = 0; ow < OW; ++ow) {
 
+              // Get a slice of the W*C dimension of the image of size kc_curr
               int image_start = (ow - PW) * C + kc;
               int image_end = bli_min(W * C, image_start + kc_curr);
 
+              // Start of the filter block of size kc_curr * mc_curr
               float *ar = filter_buf;
               if (image_start < 0) {
-                ar -= image_start * MR;
+                ar = &filter_buf[-1 * image_start * MR];
                 image_start = 0;
               }
 
@@ -172,22 +218,22 @@ static void yaconv_single_image(float *image, int H, int W, int C,
               if (K <= 0)
                 continue;
 
-              float *br = image_buf + nr * W * C + image_start * NR;
-              float *cr = output + ((nc + nr - fh + PH) * OW + ow) * M + m;
+              // Start of the image block of size kc_curr * NR
+              float *br = &image_buf[nr * W * C + image_start * NR];
+              // Start of the output block of size NR * mc_curr
+              float *cr = &output[(oh * OW + ow) * M + mc];
 
+              // MR subdivides the block of size MC into smaller blocks
               for (int mr = 0; mr < mc_curr; mr += MR) {
-                if (mr + MR <= mc_curr)
-                  bli_sgemm_ukernel(MR, NR, K, bli_s1, ar, br, bli_s1, cr, 1,
-                                    OW * M, auxinfo, cntx);
-                else {
-                  bli_sgemm_ukernel(MR, NR, K, bli_s1, ar, br, bli_s0,
-                                    output_buf, NR, 1, auxinfo, cntx);
-                  bli_sxpbys_mxn(mc_curr - mr, NR, output_buf, NR, 1, bli_s1,
-                                 cr, 1, OW * M);
-                }
 
-                ar += MR * kc_curr;
-                cr += MR;
+                if (mr + MR <= mc_curr) {
+                  bli_sgemm_ukernel(MR, NR, K, bli_s1, &ar[mr*kc_curr], br, bli_s1, &cr[mr], 1, OW * M, auxinfo, cntx);
+                } else {
+                  // beta is 0, meaning C is not accumulated, only written to
+                  bli_sgemm_ukernel(MR, NR, K, bli_s1, &ar[mr*kc_curr], br, bli_s0, output_buf, NR, 1, auxinfo, cntx);
+                  bli_sxpbys_mxn(mc_curr - mr, NR, output_buf, NR, 1, bli_s1,
+                                 &cr[mr], 1, OW * M);
+                }
               }
             }
           }
