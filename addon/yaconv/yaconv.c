@@ -203,17 +203,26 @@ static void yaconv_single_image(float *image, int H, int W, int C,
             // For every output width element
             for (int ow = 0; ow < OW; ++ow) {
 
-              // Get a slice of the W*C dimension of the image of size kc_curr
-              int image_start = (ow - PW) * C + kc;
-              int image_end = bli_min(W * C, image_start + kc_curr);
-
               // Start of the filter block of size kc_curr * mc_curr
               float *ar = filter_buf;
-              if (image_start < 0) {
+
+              // Get a slice of the W*C dimension of the image of size kc_curr.
+              // This slice slides down the image panel for every element of ow.
+              int ow_padding = ow - PW;
+              int image_start = ow_padding * C + kc;
+              int image_end = bli_min(W * C, image_start + kc_curr);
+
+              // The start may be negative if it starts in padding, if so, the
+              // end already was calculated accordingly (kc_curr is shortened),
+              // start is set to zero, and the kc_curr of the filter buf is also
+              // shortened. That is, the filter_buf skips the elements that
+              // would multiply with the padding.
+              if (ow_padding < 0) {
                 ar = &filter_buf[-1 * image_start * MR];
                 image_start = 0;
               }
 
+              // Get k dimension of the micro kernel
               int K = image_end - image_start;
               if (K <= 0)
                 continue;
@@ -221,16 +230,20 @@ static void yaconv_single_image(float *image, int H, int W, int C,
               // Start of the image block of size kc_curr * NR
               float *br = &image_buf[nr * W * C + image_start * NR];
               // Start of the output block of size NR * mc_curr
+              // Here ow varies for every output element and oh varies in blocks
+              // of NR
               float *cr = &output[(oh * OW + ow) * M + mc];
 
               // MR subdivides the block of size MC into smaller blocks
               for (int mr = 0; mr < mc_curr; mr += MR) {
 
                 if (mr + MR <= mc_curr) {
-                  bli_sgemm_ukernel(MR, NR, K, bli_s1, &ar[mr*kc_curr], br, bli_s1, &cr[mr], 1, OW * M, auxinfo, cntx);
+                  bli_sgemm_ukernel(MR, NR, K, bli_s1, &ar[mr * kc_curr], br,
+                                    bli_s1, &cr[mr], 1, OW * M, auxinfo, cntx);
                 } else {
                   // beta is 0, meaning C is not accumulated, only written to
-                  bli_sgemm_ukernel(MR, NR, K, bli_s1, &ar[mr*kc_curr], br, bli_s0, output_buf, NR, 1, auxinfo, cntx);
+                  bli_sgemm_ukernel(MR, NR, K, bli_s1, &ar[mr * kc_curr], br,
+                                    bli_s0, output_buf, NR, 1, auxinfo, cntx);
                   bli_sxpbys_mxn(mc_curr - mr, NR, output_buf, NR, 1, bli_s1,
                                  &cr[mr], 1, OW * M);
                 }
