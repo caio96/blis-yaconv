@@ -124,7 +124,8 @@ static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
   // For this to work, enable sandbox gemmlike in blis configuration
   // for (int mn = 0; mn < MN; mn += MNR) {
   //   // under_packing(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
-  //   //               bli_min(MN - mn, MNr), MNr, k, k, bli_s1, src + mn * rss,
+  //   //               bli_min(MN - mn, MNr), MNr, k, k, bli_s1, src + mn *
+  //   rss,
   //   //               rss, css, dst + mn * k, MNr, (cntx_t *)cntx);
   //   bls_spackm_cxk(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
   //                  bli_min(MN - mn, MNR), MNR, k, k, bli_s1, src + mn * rss,
@@ -198,12 +199,23 @@ static void yaconv_single_image(float *image, int H, int W, int C,
 
           // NR subdivides the block of size NC into smaller blocks
           for (int nr = 0; nr < nc_curr; nr += NR) {
+            // Get corresponding output height.
+            // The filter height is subtracted because instead of shifting the
+            // image one element in the H dimension for the next filter height
+            // and shortening nr, the image tile stays the same and the first
+            // elements of the output are stores in the extra space before as
+            // trash.
+            // Filter height can make this
+            // value negative, this is why the output has some extra space
+            // allocated before.
             int oh = nc + nr - fh + PH;
 
             // For every output width element
             for (int ow = 0; ow < OW; ++ow) {
 
-              // Start of the filter block of size kc_curr * mc_curr
+              // Start of the filter block of size kc_curr * mc_curr.
+              // This tile was fixed before loop nr, but ow check if some
+              // weights need to be skipped due to padding.
               float *ar = filter_buf;
 
               // Get a slice of the W*C dimension of the image of size kc_curr.
@@ -231,13 +243,23 @@ static void yaconv_single_image(float *image, int H, int W, int C,
               float *br = &image_buf[nr * W * C + image_start * NR];
               // Start of the output block of size NR * mc_curr
               // Here ow varies for every output element and oh varies in blocks
-              // of NR
+              // of NR minus elements of the filter height. cr starts in
+              // arbitrary places of the OH*OW dimension. But results of the
+              // multiplication are not fully store contiguously here.
               float *cr = &output[(oh * OW + ow) * M + mc];
 
               // MR subdivides the block of size MC into smaller blocks
               for (int mr = 0; mr < mc_curr; mr += MR) {
 
+                // In the gemm calls, the image tile is fixed and the filter and
+                // output vary in the M dimension
                 if (mr + MR <= mc_curr) {
+                  // The row and column stride of 1, OW * M make the output be
+                  // stored in a strided fashion. Ignoring the output channels,
+                  // it is as if output elements were stored in a single column
+                  // of the output, which is not contiguous. Spill elements are
+                  // stored in the extra space after because of this stride.
+                  // TODO: make stores contiguous
                   bli_sgemm_ukernel(MR, NR, K, bli_s1, &ar[mr * kc_curr], br,
                                     bli_s1, &cr[mr], 1, OW * M, auxinfo, cntx);
                 } else {
