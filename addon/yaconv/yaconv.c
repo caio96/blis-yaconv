@@ -72,65 +72,54 @@ static int yaconv_extra_size_before(int FH, int PH, int OW, int M) {
   return bli_max(0, FH - 1 - PH) * OW * M;
 }
 
-// a: input matrix
-// p: packed output
-// panel_dim: the innermost dimension of the panel
-// panel_len: the outermost dimension of the panel
-//   if these dimensions are less than the maximum,
-//   the rest of the panel is zeroed
-// inca: the stride of the matrix a
-// lda: the leading dimension of the matrix a
-// ldp: the leading dimension of the panel
-void under_packing(conj_t conja, pack_t schema, dim_t panel_dim,
-                   dim_t panel_dim_max, dim_t panel_len, dim_t panel_len_max,
-                   float *kappa, float *a, inc_t inca, inc_t lda, float *p,
-                   inc_t ldp, cntx_t *cntx) {
-  for (dim_t l = 0; l < panel_len; ++l) {
-    for (dim_t i = 0; i < panel_dim; ++i) {
-      float *ali = a + l * lda + i * inca;
-      float *pli = p + l * ldp + i * 1;
-      *pli = *ali;
-    }
-  }
-  if (panel_dim < panel_dim_max) {
-    const dim_t i = panel_dim;
-    const dim_t m_edge = panel_dim_max - panel_dim;
-    const dim_t n_edge = panel_len_max;
-    float *restrict p_edge = p + (i) * 1;
-    bli_sset0s_mxn(m_edge, n_edge, p_edge, 1, ldp);
-  }
-  if (panel_len < panel_len_max) {
-    const dim_t j = panel_len;
-    const dim_t m_edge = panel_dim_max;
-    const dim_t n_edge = panel_len_max - panel_len;
-    float *restrict p_edge = p + (j)*ldp;
-    bli_sset0s_mxn(m_edge, n_edge, p_edge, 1, ldp);
-  }
-}
+// Packing function based on the bli_spackm_cxk function used in the original
+// yaconv implementation
+static void yaconv_pack(conj_t conja, pack_t schema, dim_t panel_dim,
+                        dim_t panel_dim_max, dim_t panel_len,
+                        dim_t panel_len_max, float *kappa, float *a, inc_t inca,
+                        inc_t lda, float *p, inc_t ldp, cntx_t *cntx) {
+  num_t dt = PASTEMAC(s, type);
+  ukr_t ker_id =
+      bli_is_col_packed(schema) ? BLIS_PACKM_NRXK_KER : BLIS_PACKM_MRXK_KER;
 
-// Packing function
-static void yaconv_pack(float *src, int rss, int css, float *dst, int MN, int k,
-                        int MNR, const cntx_t *cntx) {
-  num_t dt = PASTEMAC_(s, type);
-  ukr_t ker_id = bli_is_col_packed(BLIS_PACKED_ROW_PANELS)
-                     ? BLIS_PACKM_NRXK_KER
-                     : BLIS_PACKM_MRXK_KER;
+  // Query the context for the packm kernel corresponding to the current panel
+  // dimension, or kernel id. If the id is invalid, the function will return
+  // NULL.
   packm_cxk_ker_ft f = bli_cntx_get_ukr_dt(dt, ker_id, cntx);
 
-  for (int mn = 0; mn < MN; mn += MNR)
-    f(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS, bli_min(MN - mn, MNR), k, k,
-      bli_s1, src + mn * rss, rss, css, dst + mn * k, MNR, cntx);
+  if (f != NULL) {
+    f(conja, schema, panel_dim, panel_len, panel_len_max, kappa, a, inca, lda,
+      p, ldp, cntx);
+  } else {
+    // Treat the micro-panel as panel_dim x panel_len and column-stored (unit
+    // row stride). The rntm_t* can safely be NULL as long as it's not used by
+    // scal2m_ex().
+    PASTEMAC2(s, scal2m, BLIS_TAPI_EX_SUF)
+    (0, BLIS_NONUNIT_DIAG, BLIS_DENSE, (trans_t)conja, panel_dim, panel_len,
+     kappa, a, inca, lda, p, 1, ldp, cntx, NULL);
 
-  // For this to work, enable sandbox gemmlike in blis configuration
-  // for (int mn = 0; mn < MN; mn += MNR) {
-  //   // under_packing(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
-  //   //               bli_min(MN - mn, MNr), MNr, k, k, bli_s1, src + mn *
-  //   rss,
-  //   //               rss, css, dst + mn * k, MNr, (cntx_t *)cntx);
-  //   bls_spackm_cxk(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
-  //                  bli_min(MN - mn, MNR), MNR, k, k, bli_s1, src + mn * rss,
-  //                  rss, css, dst + mn * k, MNR, (cntx_t *)cntx);
-  // }
+    // If panel_dim < panel_dim_max, then we zero those unused rows.
+    if (panel_dim < panel_dim_max) {
+      const dim_t i = panel_dim;
+      const dim_t m_edge = panel_dim_max - panel_dim;
+      const dim_t n_edge = panel_len_max;
+      float *restrict p_edge = p + (i) * 1;
+
+      PASTEMAC(s, set0s_mxn)
+      (m_edge, n_edge, p_edge, 1, ldp);
+    }
+
+    // If panel_len < panel_len_max, then we zero those unused columns.
+    if (panel_len < panel_len_max) {
+      const dim_t j = panel_len;
+      const dim_t m_edge = panel_dim_max;
+      const dim_t n_edge = panel_len_max - panel_len;
+      float *restrict p_edge = p + (j)*ldp;
+
+      PASTEMAC(s, set0s_mxn)
+      (m_edge, n_edge, p_edge, 1, ldp);
+    }
+  }
 }
 
 // The main yaconv function that computes convolution on a single image
@@ -160,13 +149,12 @@ static void yaconv_single_image(float *image, int H, int W, int C,
     // Pack block of the image of size W*C x nc_curr
     // where nc_curr is divided into blocks of size NR.
     // This packing transposes the image (inca is not 1)
-    // yaconv_pack(&image[nc * W * C], W * C, 1, image_buf, nc_curr, W * C, NR,
-    //             cntx);
     for (int nr = 0; nr < nc_curr; nr += NR) {
-      under_packing(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
-                    bli_min(nc_curr - nr, NR), NR, W * C, W * C, bli_s1,
-                    &image[(nc + nr) * W * C], W * C, 1, &image_buf[nr * W * C],
-                    NR, (cntx_t *)cntx);
+      // bls_spackm_cxk also works here if gemm-like sandbox is enabled
+      yaconv_pack(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
+                  bli_min(nc_curr - nr, NR), NR, W * C, W * C, bli_s1,
+                  &image[(nc + nr) * W * C], W * C, 1, &image_buf[nr * W * C],
+                  NR, (cntx_t *)cntx);
     }
 
     // For every element in the filter height
@@ -189,13 +177,14 @@ static void yaconv_single_image(float *image, int H, int W, int C,
 
           // Pack block of the filter of size kc_curr x mc_curr
           // where mc_curr is divided into blocks of size MR.
-          // yaconv_pack(&filter[(fh * FW * C + kc) * M + mc], 1, M, filter_buf,
+          // yaconv_pack(&filter[(fh * FW * C + kc) * M + mc], 1, M,
+          // filter_buf,
           //             mc_curr, kc_curr, MR, cntx);
           for (int mr = 0; mr < mc_curr; mr += MR) {
-            under_packing(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
-                          bli_min(mc_curr - mr, MR), MR, kc_curr, kc_curr,
-                          bli_s1, &filter[(fh * FW * C + kc) * M + mc + mr], 1,
-                          M, &filter_buf[mr * kc_curr], MR, (cntx_t *)cntx);
+            yaconv_pack(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
+                        bli_min(mc_curr - mr, MR), MR, kc_curr, kc_curr, bli_s1,
+                        &filter[(fh * FW * C + kc) * M + mc + mr], 1, M,
+                        &filter_buf[mr * kc_curr], MR, (cntx_t *)cntx);
           }
 
           // NR subdivides the block of size NC into smaller blocks
