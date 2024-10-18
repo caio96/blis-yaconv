@@ -177,10 +177,8 @@ static void yaconv_single_image(float *image, int H, int W, int C,
 
           // Pack block of the filter of size kc_curr x mc_curr
           // where mc_curr is divided into blocks of size MR.
-          // yaconv_pack(&filter[(fh * FW * C + kc) * M + mc], 1, M,
-          // filter_buf,
-          //             mc_curr, kc_curr, MR, cntx);
           for (int mr = 0; mr < mc_curr; mr += MR) {
+            // bls_spackm_cxk also works here if gemm-like sandbox is enabled
             yaconv_pack(BLIS_NO_CONJUGATE, BLIS_PACKED_ROW_PANELS,
                         bli_min(mc_curr - mr, MR), MR, kc_curr, kc_curr, bli_s1,
                         &filter[(fh * FW * C + kc) * M + mc + mr], 1, M,
@@ -189,14 +187,12 @@ static void yaconv_single_image(float *image, int H, int W, int C,
 
           // NR subdivides the block of size NC into smaller blocks
           for (int nr = 0; nr < nc_curr; nr += NR) {
-            // Get corresponding output height.
-            // The filter height is subtracted because instead of shifting the
-            // image one element in the H dimension for the next filter height
-            // and shortening nr, the image tile stays the same and the first
-            // elements of the output are stores in the extra space before as
-            // trash.
-            // Filter height can make this
-            // value negative, this is why the output has some extra space
+            // Get corresponding output height. The filter height is subtracted
+            // because instead of shifting the image one element in the H
+            // dimension for the next filter height and shortening nr, the image
+            // tile stays the same and the first elements of the output are
+            // stores in the extra space before as trash. Filter height can make
+            // this value negative, this is why the output has some extra space
             // allocated before.
             int oh = nc + nr - fh + PH;
 
@@ -251,6 +247,7 @@ static void yaconv_single_image(float *image, int H, int W, int C,
                   // single column of the output, which is not contiguous.
                   // Spill elements are stored in the extra space after
                   // because of this stride.
+                  //
                   // TODO: make stores contiguous
                   bli_sgemm_ukernel(MR, NR, K, bli_s1, &ar[mr * kc_curr], br,
                                     bli_s1, &cr[mr], 1, OW * M, auxinfo, cntx);
@@ -317,7 +314,7 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
     yaconv_single_image(&images[i * H * W * C], H, W, C, filter, FH, FW, M,
                         single_output, PH, PW, MC, NC, KC, MR, NR, image_buf,
                         filter_buf, output_buf, auxinfo, cntx);
-    // Convert single output to NHWC
+    // Convert single output to NHWC (remove extra space before and after)
     for (int j = 0; j < OH * OW * M; ++j) {
       outputs[i * OH * OW * M + j] = single_output[j + extra_before];
     }
