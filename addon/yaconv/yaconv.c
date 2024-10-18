@@ -174,7 +174,8 @@ static void yaconv_single_image(float *image, int H, int W, int C,
 
       // MC divides the number of output channels into blocks
       for (int mc = 0; mc < M; mc += MC) {
-        // Get block of size MC, or, if the last block is smaller, the remaining
+        // Get block of size MC, or, if the last block is smaller, the
+        // remaining
         int mc_curr = bli_min(M - mc, MC);
 
         // TODO: check if the kc loop should be moved outside the mc loop
@@ -218,17 +219,18 @@ static void yaconv_single_image(float *image, int H, int W, int C,
               // weights need to be skipped due to padding.
               float *ar = filter_buf;
 
-              // Get a slice of the W*C dimension of the image of size kc_curr.
-              // This slice slides down the image panel for every element of ow.
+              // Get a slice of the W*C dimension of the image of size
+              // kc_curr. This slice slides down the image panel for every
+              // element of ow.
               int ow_padding = ow - PW;
               int image_start = ow_padding * C + kc;
               int image_end = bli_min(W * C, image_start + kc_curr);
 
               // The start may be negative if it starts in padding, if so, the
-              // end already was calculated accordingly (kc_curr is shortened),
-              // start is set to zero, and the kc_curr of the filter buf is also
-              // shortened. That is, the filter_buf skips the elements that
-              // would multiply with the padding.
+              // end already was calculated accordingly (kc_curr is
+              // shortened), start is set to zero, and the kc_curr of the
+              // filter buf is also shortened. That is, the filter_buf skips
+              // the elements that would multiply with the padding.
               if (ow_padding < 0) {
                 ar = &filter_buf[-1 * image_start * MR];
                 image_start = 0;
@@ -242,23 +244,24 @@ static void yaconv_single_image(float *image, int H, int W, int C,
               // Start of the image block of size kc_curr * NR
               float *br = &image_buf[nr * W * C + image_start * NR];
               // Start of the output block of size NR * mc_curr
-              // Here ow varies for every output element and oh varies in blocks
-              // of NR minus elements of the filter height. cr starts in
-              // arbitrary places of the OH*OW dimension. But results of the
-              // multiplication are not fully store contiguously here.
+              // Here ow varies for every output element and oh varies in
+              // blocks of NR minus elements of the filter height. cr starts
+              // in arbitrary places of the OH*OW dimension. But results of
+              // the multiplication are not fully store contiguously here.
               float *cr = &output[(oh * OW + ow) * M + mc];
 
               // MR subdivides the block of size MC into smaller blocks
               for (int mr = 0; mr < mc_curr; mr += MR) {
 
-                // In the gemm calls, the image tile is fixed and the filter and
-                // output vary in the M dimension
+                // In the gemm calls, the image tile is fixed and the filter
+                // and output vary in the M dimension
                 if (mr + MR <= mc_curr) {
                   // The row and column stride of 1, OW * M make the output be
-                  // stored in a strided fashion. Ignoring the output channels,
-                  // it is as if output elements were stored in a single column
-                  // of the output, which is not contiguous. Spill elements are
-                  // stored in the extra space after because of this stride.
+                  // stored in a strided fashion. Ignoring the output
+                  // channels, it is as if output elements were stored in a
+                  // single column of the output, which is not contiguous.
+                  // Spill elements are stored in the extra space after
+                  // because of this stride.
                   // TODO: make stores contiguous
                   bli_sgemm_ukernel(MR, NR, K, bli_s1, &ar[mr * kc_curr], br,
                                     bli_s1, &cr[mr], 1, OW * M, auxinfo, cntx);
@@ -397,7 +400,8 @@ static void yaconv_single_image_prepack(float *image, int H, int W, int C,
 
     int nc_curr = bli_min(H - nc, NC);
 
-    // yaconv_pack(image + nc * W * C, W * C, 1, image_buf, nc_curr, W * C, NR,
+    // yaconv_pack(image + nc * W * C, W * C, 1, image_buf, nc_curr, W * C,
+    // NR,
     //             cntx);
     float *image_buf = image + nc * W * C;
 
@@ -410,7 +414,8 @@ static void yaconv_single_image_prepack(float *image, int H, int W, int C,
 
           int kc_curr = bli_min(FW * C - kc, KC);
 
-          // yaconv_pack(filter + (fh * FW * C + kc) * M + m, 1, M, filter_buf,
+          // yaconv_pack(filter + (fh * FW * C + kc) * M + m, 1, M,
+          // filter_buf,
           //             mc_curr, kc_curr, MR, cntx);
           float *filter_buf = filter + (fh * FW * C + kc) * M + m;
 
@@ -434,8 +439,8 @@ static void yaconv_single_image_prepack(float *image, int H, int W, int C,
               float *cr = output + ((nc + nr - fh + PH) * OW + ow) * M + m;
 
               for (int mr = 0; mr < mc_curr; mr += MR) {
-                // TODO: check if output_buf could store the output of this gemm
-                // and throw away spill over results when copying to cr
+                // TODO: check if output_buf could store the output of this
+                // gemm and throw away spill over results when copying to cr
                 if (mr + MR <= mc_curr)
                   bli_sgemm_ukernel(MR, NR, K, bli_s1, ar, br, bli_s1, cr, 1,
                                     OW * M, auxinfo, cntx);
