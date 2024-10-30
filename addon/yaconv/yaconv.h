@@ -38,10 +38,11 @@
 #define YACONV_H
 
 BLIS_EXPORT_ADDON void yaconv(float *images, int N, int H, int W, int C,
-                              float *filter, int FH, int FW, int M,
-                              float *outputs, int PH, int PW);
+                              float *filter, int FH, int FW, int OH, int OW,
+                              int M, float *outputs, int PH, int PW);
 
 BLIS_EXPORT_ADDON void yaconv_ex(float *images, int N, int H, int W, int C,
-                                 float *filter, int FH, int FW, int M,
-                                 float *outputs, int PH, int PW, cntx_t *cntx);
+                                 float *filter, int FH, int FW, int OH, int OW,
+                                 int M, float *outputs, int PH, int PW,
+                                 cntx_t *cntx);
 #endif

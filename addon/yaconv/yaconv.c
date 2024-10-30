@@ -268,7 +268,8 @@ static void yaconv_single_image(float *image, int H, int W, int C,
 }
 
 void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
-               int FW, int M, float *outputs, int PH, int PW, cntx_t *cntx) {
+               int FW, int OH, int OW, int M, float *outputs, int PH, int PW,
+               cntx_t *cntx) {
   // Get valid context
   if (cntx == NULL)
     cntx = (cntx_t *)bli_gks_query_cntx();
@@ -292,9 +293,9 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
   NC += (NC % NR) ? NR - NC % NR : 0;
   KC = bli_min(FW * C, KC); // to use less buffer space for small inputs
 
-  // Output dimensions
-  int OH = H + 2 * PH - FH + 1;
-  int OW = W + 2 * PW - FW + 1;
+  // // Output dimensions
+  // int OH = H + 2 * PH - FH + 1;
+  // int OW = W + 2 * PW - FW + 1;
 
   // Extra offset required by yaconv
   int extra_before = yaconv_extra_size_before(FH, PH, OW, M);
@@ -329,6 +330,7 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
 }
 
 void yaconv(float *images, int N, int H, int W, int C, float *filter, int FH,
-            int FW, int M, float *outputs, int PH, int PW) {
-  yaconv_ex(images, N, H, W, C, filter, FH, FW, M, outputs, PH, PW, NULL);
+            int FW, int OH, int OW, int M, float *outputs, int PH, int PW) {
+  yaconv_ex(images, N, H, W, C, filter, FH, FW, OH, OW, M, outputs, PH, PW,
+            NULL);
 }
