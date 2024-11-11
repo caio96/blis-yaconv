@@ -269,7 +269,7 @@ static void yaconv_single_image(float *image, int H, int W, int C,
 
 void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
                int FW, int OH, int OW, int M, float *outputs, int PH, int PW,
-               cntx_t *cntx) {
+               float *bias, cntx_t *cntx) {
   // Get valid context
   if (cntx == NULL)
     cntx = (cntx_t *)bli_gks_query_cntx();
@@ -311,13 +311,20 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
       aligned_alloc(OH * OW * M + extra_before + extra_after);
 
   // Run yaconv on each image
-  for (int i = 0; i < N; ++i) {
-    yaconv_single_image(&images[i * H * W * C], H, W, C, filter, FH, FW, M,
+  for (int n = 0; n < N; ++n) {
+    yaconv_single_image(&images[n * H * W * C], H, W, C, filter, FH, FW, M,
                         single_output, PH, PW, MC, NC, KC, MR, NR, image_buf,
                         filter_buf, output_buf, auxinfo, cntx);
     // Convert single output to NHWC (remove extra space before and after)
-    for (int j = 0; j < OH * OW * M; ++j) {
-      outputs[i * OH * OW * M + j] = single_output[j + extra_before];
+    // and add bias
+    for (int i = 0; i < OH * OW; ++i) {
+      for (int j = 0; j < M; ++j) {
+        outputs[n * OH * OW * M + i * M + j] =
+            single_output[i * M + j + extra_before];
+        if (bias != NULL) {
+          outputs[i * M + j] += bias[j];
+        }
+      }
     }
   }
 
@@ -330,7 +337,8 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
 }
 
 void yaconv(float *images, int N, int H, int W, int C, float *filter, int FH,
-            int FW, int OH, int OW, int M, float *outputs, int PH, int PW) {
+            int FW, int OH, int OW, int M, float *outputs, int PH, int PW,
+            float *bias) {
   yaconv_ex(images, N, H, W, C, filter, FH, FW, OH, OW, M, outputs, PH, PW,
-            NULL);
+            bias, NULL);
 }
