@@ -166,9 +166,6 @@ static void yaconv_single_image(float *image, int H, int W, int C,
         // remaining
         int mc_curr = bli_min(M - mc, MC);
 
-        // TODO: check if the kc loop should be moved outside the mc loop
-        //       because M is the innermost dimension of the filter
-        //
         // KC divides the filter width times input channels into blocks
         for (int kc = 0; kc < FW * C; kc += KC) {
           // Get block of size KC, or, if the last block is smaller, the
@@ -247,8 +244,6 @@ static void yaconv_single_image(float *image, int H, int W, int C,
                   // single column of the output, which is not contiguous.
                   // Spill elements are stored in the extra space after
                   // because of this stride.
-                  //
-                  // TODO: make stores contiguous
                   bli_sgemm_ukernel(MR, NR, K, bli_s1, &ar[mr * kc_curr], br,
                                     bli_s1, &cr[mr], 1, OW * M, auxinfo, cntx);
                 } else {
@@ -284,7 +279,6 @@ void yaconv_ex(float *images, int N, int H, int W, int C, float *filter, int FH,
   int KC = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_KC, cntx);
   int NC = bli_cntx_get_blksz_def_dt(BLIS_FLOAT, BLIS_NC, cntx);
 
-  // TODO: NC could be smaller for the input 1, 64, 64, 64, 128, 3, 3
   // TODO: NC blows up for input 1,1,3,3,1,2,2,1,1,0,0
   //
   // Adjust NC at run-time so that the packed image buffer fits in L3 and
